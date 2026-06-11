@@ -1,6 +1,6 @@
-import os, json, sqlite3, textwrap, datetime as dt
+import os, json, sqlite3, textwrap, datetime as dt, time
 from dataclasses import dataclass
-from typing import List, Dict, Optional
+from typing import List, Dict, Optional, Tuple
 
 import numpy as np
 import pandas as pd
@@ -8,6 +8,7 @@ import plotly.graph_objects as go
 import streamlit as st
 import yfinance as yf
 import feedparser
+import requests
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -56,22 +57,126 @@ def rsi(series: pd.Series, period: int = 14) -> pd.Series:
 
 def enrich(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
+    # 기존 분석 호환용 단순이동평균선
     df["MA20"] = df["Close"].rolling(20).mean()
     df["MA60"] = df["Close"].rolling(60).mean()
     df["MA120"] = df["Close"].rolling(120).mean()
+    # 차트/스캐너 기준: 8·13은 지수이동평균선, 21·55는 단순이동평균선
+    df["EMA8"] = df["Close"].ewm(span=8, adjust=False).mean()
+    df["EMA13"] = df["Close"].ewm(span=13, adjust=False).mean()
+    df["MA21"] = df["Close"].rolling(21).mean()
+    df["MA55"] = df["Close"].rolling(55).mean()
     df["RSI14"] = rsi(df["Close"], 14)
     df["RET20"] = df["Close"].pct_change(20)
     df["VOL20"] = df["Close"].pct_change().rolling(20).std() * np.sqrt(252)
+    # 실전 개선 v8+: 거래량·수급 대체 지표
+    if "Volume" in df.columns:
+        df["VOL_MA20"] = df["Volume"].rolling(20).mean()
+        df["VOL_RATIO"] = df["Volume"] / df["VOL_MA20"].replace(0, np.nan)
+        direction = np.sign(df["Close"].diff()).fillna(0)
+        df["OBV"] = (direction * df["Volume"].fillna(0)).cumsum()
+        df["OBV_MA10"] = df["OBV"].rolling(10).mean()
     return df
 
-def fetch_price(ticker: str, period="1y") -> pd.DataFrame:
-    df = yf.download(ticker, period=period, interval="1d", auto_adjust=False, progress=False)
+def fetch_price(ticker: str, period="1y", interval="1d") -> pd.DataFrame:
+    df = yf.download(ticker, period=period, interval=interval, auto_adjust=False, progress=False)
     if df.empty:
         return df
     if isinstance(df.columns, pd.MultiIndex):
         df.columns = df.columns.get_level_values(0)
     df = df.dropna()
     return enrich(df)
+
+def fetch_price_preset(ticker: str, preset="6mo") -> pd.DataFrame:
+    # 메인 이동평균 차트 기간/봉 기준
+    # 6개월 이상은 일봉, 1개월/1주일/하루는 30분봉으로 표시합니다.
+    if preset == "30m":
+        return fetch_price(ticker, period="60d", interval="30m")
+    if preset == "1mo":
+        return fetch_price(ticker, period="1mo", interval="30m")
+    if preset == "1wk":
+        return fetch_price(ticker, period="5d", interval="30m")
+    if preset == "1d":
+        return fetch_price(ticker, period="1d", interval="30m")
+    return fetch_price(ticker, period=preset, interval="1d")
+
+def fetch_hhll_price_preset(ticker: str, preset="1mo") -> pd.DataFrame:
+    # 터틀트레이딩 참고용 HHLL 차트는 15분봉만 사용합니다.
+    # Yahoo Finance는 15분봉 장기 데이터 제한이 있어 6개월 선택 시 우선 6mo로 시도하고, 실패하면 60d로 대체합니다.
+    period_map = {"6mo": "6mo", "1mo": "1mo", "1wk": "5d", "1d": "1d"}
+    period = period_map.get(preset, "1mo")
+    df = fetch_price(ticker, period=period, interval="15m")
+    if df.empty and preset == "6mo":
+        df = fetch_price(ticker, period="60d", interval="15m")
+    return df
+
+def add_hhll(df: pd.DataFrame, highest_n: int = 20, lowest_n: int = 10) -> pd.DataFrame:
+    d = df.copy()
+    d["HH20"] = d["High"].rolling(highest_n).max()
+    d["LL10"] = d["Low"].rolling(lowest_n).min()
+    return d
+
+def _is_intraday_index(index) -> bool:
+    try:
+        if len(index) < 2:
+            return False
+        delta = pd.Series(index).diff().dropna().median()
+        return delta < pd.Timedelta(days=1)
+    except Exception:
+        return False
+
+def make_compact_x(df: pd.DataFrame):
+    """거래 없는 야간/주말 공백을 제거하기 위해 intraday 차트는 category 축용 라벨을 사용합니다."""
+    if df is None or df.empty:
+        return []
+    if _is_intraday_index(df.index):
+        return [pd.Timestamp(x).strftime("%m-%d %H:%M") for x in df.index]
+    return df.index
+
+def turtle_metrics(df: pd.DataFrame, highest_n: int = 20, lowest_n: int = 10) -> Dict:
+    """15분봉 HH20/LL10 기준 터틀 참고 점수. 돌파는 전봉 기준 HH/LL을 사용합니다."""
+    if df is None or df.empty or len(df) < max(highest_n, lowest_n) + 3:
+        return {"score": 0.0, "status": "HHLL 데이터 부족", "hh_breakout": False, "ll_breakdown": False}
+    d = add_hhll(df, highest_n, lowest_n).dropna().copy()
+    if len(d) < 3:
+        return {"score": 0.0, "status": "HHLL 계산 데이터 부족", "hh_breakout": False, "ll_breakdown": False}
+    last = d.iloc[-1]
+    prev = d.iloc[-2]
+    close = _safe_float(last.get("Close")) if '_safe_float' in globals() else float(last.get("Close"))
+    high = _safe_float(last.get("High")) if '_safe_float' in globals() else float(last.get("High"))
+    low = _safe_float(last.get("Low")) if '_safe_float' in globals() else float(last.get("Low"))
+    prev_hh = _safe_float(prev.get("HH20")) if '_safe_float' in globals() else float(prev.get("HH20"))
+    prev_ll = _safe_float(prev.get("LL10")) if '_safe_float' in globals() else float(prev.get("LL10"))
+    hh_now = _safe_float(last.get("HH20")) if '_safe_float' in globals() else float(last.get("HH20"))
+    ll_now = _safe_float(last.get("LL10")) if '_safe_float' in globals() else float(last.get("LL10"))
+    if any(pd.isna(x) for x in [close, high, low, prev_hh, prev_ll, hh_now, ll_now]):
+        return {"score": 0.0, "status": "HHLL 계산값 부족", "hh_breakout": False, "ll_breakdown": False}
+    hh_breakout = high >= prev_hh or close > prev_hh
+    ll_breakdown = low <= prev_ll or close < prev_ll
+    # HH20에 가까울수록 가산, LL10에 가까우면 감점
+    width = max(prev_hh - prev_ll, 1e-9)
+    hh_proximity = max(0.0, min(1.0, 1 - (prev_hh - close) / width))
+    ll_risk = max(0.0, min(1.0, 1 - (close - prev_ll) / width))
+    score = 0.0
+    if hh_breakout:
+        score += 2.0
+    else:
+        score += hh_proximity * 1.0
+    if ll_breakdown:
+        score -= 2.0
+    else:
+        score -= ll_risk * 0.8
+    status = "HH20 돌파" if hh_breakout else "LL10 이탈" if ll_breakdown else "HH20 접근" if hh_proximity >= 0.75 else "중립"
+    return {
+        "score": round(float(score), 2),
+        "status": status,
+        "hh_breakout": bool(hh_breakout),
+        "ll_breakdown": bool(ll_breakdown),
+        "hh20": round(float(hh_now), 2),
+        "ll10": round(float(ll_now), 2),
+        "hh_proximity": round(float(hh_proximity), 2),
+        "ll_risk": round(float(ll_risk), 2),
+    }
 
 # ---------------------------- News -----------------------------
 def google_news_rss(query: str) -> List[Dict]:
@@ -119,29 +224,163 @@ def technical_score(df: pd.DataFrame) -> Dict:
     elif ret20 < -0.05: score -= 0.5; reasons.append("최근 20거래일 하락 모멘텀")
     return {"score": score, "reasons": reasons, "close": close, "rsi": rsi14}
 
+
+def volume_score(df: pd.DataFrame) -> Dict:
+    """거래량 폭증·OBV 개선 점수. 기관 수급 데이터가 없는 미국 주식에서는 수급 대체 지표로 사용합니다."""
+    if df is None or df.empty or len(df) < 25:
+        return {"score": 0.0, "reasons": ["거래량 데이터 부족"], "vol_ratio": 0.0}
+    last = df.iloc[-1]
+    prev = df.iloc[-2] if len(df) >= 2 else last
+    score = 0.0
+    reasons = []
+    close = _safe_float(last.get("Close"))
+    prev_close = _safe_float(prev.get("Close"))
+    vol_ratio = _safe_float(last.get("VOL_RATIO"), 0.0)
+    obv = _safe_float(last.get("OBV"))
+    obv_ma = _safe_float(last.get("OBV_MA10"))
+    if vol_ratio >= 2.0 and close >= prev_close:
+        score += 1.5; reasons.append(f"상승 거래량 급증({vol_ratio:.1f}배)")
+    elif vol_ratio >= 1.5 and close >= prev_close:
+        score += 1.0; reasons.append(f"상승 거래량 증가({vol_ratio:.1f}배)")
+    elif vol_ratio >= 1.5 and close < prev_close:
+        score -= 1.0; reasons.append(f"하락 거래량 증가({vol_ratio:.1f}배)")
+    else:
+        reasons.append(f"거래량 보통({vol_ratio:.1f}배)")
+    if not np.isnan(obv) and not np.isnan(obv_ma):
+        if obv > obv_ma:
+            score += 0.7; reasons.append("OBV가 10봉 평균 위")
+        else:
+            score -= 0.4; reasons.append("OBV가 10봉 평균 아래")
+    return {"score": round(float(score), 2), "reasons": reasons, "vol_ratio": round(float(vol_ratio), 2)}
+
+
+def fundamental_score(ticker: str) -> Dict:
+    """매출·EPS 성장, 마진, 밸류에이션을 간단히 점수화합니다. 데이터가 없으면 중립 처리합니다."""
+    score = 0.0
+    reasons = []
+    data = {}
+    try:
+        info = yf.Ticker(ticker).info or {}
+        data = info
+    except Exception:
+        return {"score": 0.0, "reasons": ["재무 데이터 수집 실패"], "data": {}}
+    revenue_growth = data.get("revenueGrowth")
+    earnings_growth = data.get("earningsGrowth")
+    profit_margin = data.get("profitMargins")
+    forward_pe = data.get("forwardPE")
+    target_mean = data.get("targetMeanPrice")
+    current = data.get("currentPrice") or data.get("regularMarketPrice")
+    if isinstance(revenue_growth, (int, float)):
+        if revenue_growth > 0.15:
+            score += 1.0; reasons.append(f"매출 성장 양호({revenue_growth*100:.1f}%)")
+        elif revenue_growth > 0:
+            score += 0.4; reasons.append(f"매출 성장 유지({revenue_growth*100:.1f}%)")
+        else:
+            score -= 0.7; reasons.append(f"매출 역성장({revenue_growth*100:.1f}%)")
+    if isinstance(earnings_growth, (int, float)):
+        if earnings_growth > 0.15:
+            score += 1.0; reasons.append(f"EPS 성장 양호({earnings_growth*100:.1f}%)")
+        elif earnings_growth > 0:
+            score += 0.4; reasons.append(f"EPS 성장 유지({earnings_growth*100:.1f}%)")
+        else:
+            score -= 0.8; reasons.append(f"EPS 감소({earnings_growth*100:.1f}%)")
+    if isinstance(profit_margin, (int, float)):
+        if profit_margin > 0.15:
+            score += 0.6; reasons.append(f"순이익률 양호({profit_margin*100:.1f}%)")
+        elif profit_margin < 0:
+            score -= 0.6; reasons.append("순손실 상태")
+    if isinstance(forward_pe, (int, float)) and forward_pe > 0:
+        if forward_pe < 25:
+            score += 0.4; reasons.append(f"Forward P/E 부담 낮음({forward_pe:.1f})")
+        elif forward_pe > 80:
+            score -= 0.6; reasons.append(f"Forward P/E 부담 높음({forward_pe:.1f})")
+    if isinstance(target_mean, (int, float)) and isinstance(current, (int, float)) and current > 0:
+        upside = (target_mean/current - 1) * 100
+        if upside > 15:
+            score += 0.6; reasons.append(f"평균 목표가 대비 여력({upside:.1f}%)")
+        elif upside < -10:
+            score -= 0.5; reasons.append(f"평균 목표가 대비 부담({upside:.1f}%)")
+    return {"score": round(float(score), 2), "reasons": reasons[:5] or ["확인 가능한 재무 데이터 부족"], "data": {"revenueGrowth": revenue_growth, "earningsGrowth": earnings_growth, "profitMargins": profit_margin, "forwardPE": forward_pe}}
+
+
+def options_flow_score(ticker: str) -> Dict:
+    """기관 수급을 직접 알 수 없는 미국 주식에서 옵션 콜/풋 흐름을 보조 지표로 사용합니다."""
+    try:
+        tk = yf.Ticker(ticker)
+        expiries = tk.options
+        if not expiries:
+            return {"score": 0.0, "reasons": ["옵션 데이터 없음"], "call_put_ratio": None}
+        chain = tk.option_chain(expiries[0])
+        calls = chain.calls
+        puts = chain.puts
+        call_flow = float(calls.get("volume", pd.Series(dtype=float)).fillna(0).sum() + 0.3 * calls.get("openInterest", pd.Series(dtype=float)).fillna(0).sum())
+        put_flow = float(puts.get("volume", pd.Series(dtype=float)).fillna(0).sum() + 0.3 * puts.get("openInterest", pd.Series(dtype=float)).fillna(0).sum())
+        ratio = call_flow / max(put_flow, 1.0)
+        score = 0.0
+        reasons = []
+        if ratio >= 1.5:
+            score += 0.8; reasons.append(f"콜 옵션 우위({ratio:.1f}배)")
+        elif ratio <= 0.7:
+            score -= 0.8; reasons.append(f"풋 옵션 우위({ratio:.1f}배)")
+        else:
+            reasons.append(f"옵션 흐름 중립({ratio:.1f}배)")
+        return {"score": round(float(score), 2), "reasons": reasons, "call_put_ratio": round(float(ratio), 2)}
+    except Exception:
+        return {"score": 0.0, "reasons": ["옵션 데이터 수집 실패"], "call_put_ratio": None}
+
+
+def advanced_news_score(news: Dict) -> Dict:
+    """단순 긍/부정 단어보다 목표가·가이던스·실적 상향 키워드에 더 큰 가중치를 줍니다."""
+    titles = []
+    for k, v in (news or {}).items():
+        if isinstance(v, list):
+            titles += [x.get("title", "") for x in v]
+    text = " ".join(titles).lower()
+    weighted_pos = {
+        "raises price target": 1.2, "price target raised": 1.2, "upgrade": 1.0, "upgraded": 1.0,
+        "beats estimates": 1.0, "beat estimates": 1.0, "guidance raised": 1.2, "raises guidance": 1.2,
+        "record revenue": 0.8, "margin expansion": 0.8, "strong demand": 0.7, "buy rating": 0.6,
+        "bullish": 0.4, "growth": 0.3, "profit": 0.3
+    }
+    weighted_neg = {
+        "cuts price target": 1.2, "price target cut": 1.2, "downgrade": 1.0, "downgraded": 1.0,
+        "misses estimates": 1.0, "miss estimates": 1.0, "guidance cut": 1.2, "cuts guidance": 1.2,
+        "weak demand": 0.8, "margin pressure": 0.8, "lawsuit": 0.6, "probe": 0.6, "sell rating": 0.6,
+        "bearish": 0.4, "risk": 0.25, "tariff": 0.25
+    }
+    pos = sum(text.count(k) * w for k, w in weighted_pos.items())
+    neg = sum(text.count(k) * w for k, w in weighted_neg.items())
+    score = max(-3.0, min(3.0, (pos - neg) * 0.45))
+    return {"score": round(float(score), 2), "positive_weight": round(float(pos), 2), "negative_weight": round(float(neg), 2)}
+
 def keyword_sentiment(news: Dict) -> Dict:
     text = " ".join([x["title"] for k in news for x in (news[k] if isinstance(news[k], list) else [])]).lower()
     pos = ["beat", "growth", "surge", "record", "upgrade", "profit", "margin", "strong", "buy", "bullish"]
     neg = ["miss", "cut", "weak", "lawsuit", "probe", "downgrade", "loss", "slow", "risk", "bearish", "tariff"]
     p = sum(text.count(w) for w in pos); n = sum(text.count(w) for w in neg)
-    return {"score": (p - n) * 0.25, "positive_hits": p, "negative_hits": n}
+    adv = advanced_news_score(news)
+    simple = (p - n) * 0.15
+    score = max(-3.5, min(3.5, simple + float(adv.get("score", 0))))
+    return {"score": round(float(score), 2), "positive_hits": p, "negative_hits": n, "advanced": adv}
 
 def make_opinion(ticker: str, df: pd.DataFrame, news: Dict) -> Dict:
     tech = technical_score(df)
     sent = keyword_sentiment(news)
-    score = tech["score"] + sent["score"]
-    opinion = "매수" if score >= 1.0 else "매도" if score <= -1.0 else "관망"
-    headlines = []
-    for section in ["seeking_alpha_signal", "us_economy_news", "company_news"]:
-        headlines += [x["title"] for x in news.get(section, [])[:3]]
+    vol = volume_score(df)
+    fund = fundamental_score(ticker)
+    opt = options_flow_score(ticker)
+    score = tech["score"] + sent["score"] + vol["score"] + fund["score"] + opt["score"]
+    opinion = "매수" if score >= 2.0 else "매도" if score <= -1.5 else "관망"
     summary = (
         f"{opinion}\n"
-        f"{ticker}의 기술점수는 {tech['score']:.1f}, 뉴스 키워드 점수는 {sent['score']:.1f}입니다.\n"
+        f"{ticker}의 기술점수는 {tech['score']:.1f}, 뉴스 키워드 점수는 {sent['score']:.1f}, 거래량 점수는 {vol['score']:.1f}, 재무점수는 {fund['score']:.1f}, 옵션/수급점수는 {opt['score']:.1f}입니다.\n"
         f"핵심 기술 근거는 {', '.join(tech['reasons'][:4])}입니다.\n"
-        f"시킹알파 관련 헤드라인, 미국 경제뉴스, 기업뉴스를 함께 보면 현재 점수는 {score:.1f}로 평가됩니다.\n"
+        f"거래량 근거는 {', '.join(vol['reasons'][:3])}입니다.\n"
+        f"실적/밸류 근거는 {', '.join(fund['reasons'][:3])}입니다.\n"
+        f"시킹알파 관련 헤드라인, 미국 경제뉴스, 기업뉴스, 거래량, 재무, 옵션 흐름을 함께 보면 현재 점수는 {score:.1f}로 평가됩니다.\n"
         f"최근 확인된 주요 헤드라인:"
     )
-    return {"opinion": opinion, "summary": summary, "score": score, "tech": tech, "news": news}
+    return {"opinion": opinion, "summary": summary, "score": score, "tech": tech, "news": news, "volume": vol, "fundamental": fund, "options": opt}
 
 # ------------------------- OpenAI option -----------------------
 def llm_refine(ticker: str, raw: Dict) -> Dict:
@@ -188,27 +427,359 @@ def run_analysis(ticker: str, use_llm=True, force=False):
         raise ValueError(f"{ticker} 가격 데이터를 가져오지 못했습니다.")
     news = collect_news(ticker)
     result = make_opinion(ticker.upper(), df, news)
+    try:
+        hhll_df = fetch_hhll_price_preset(ticker, preset="1mo")
+        turtle = turtle_metrics(hhll_df)
+        result["turtle"] = turtle
+        result["score"] = float(result.get("score", 0)) + float(turtle.get("score", 0))
+        result["summary"] += f"\n터틀트레이딩 참고 점수는 {turtle.get('score', 0):.1f}이며 상태는 {turtle.get('status', '중립')}입니다."
+        result["opinion"] = "매수" if result["score"] >= 2.0 else "매도" if result["score"] <= -1.5 else "관망"
+    except Exception:
+        result["turtle"] = {"score": 0.0, "status": "HHLL 계산 실패"}
     if use_llm:
         result = llm_refine(ticker.upper(), result)
     save_analysis(ticker, result)
     return result
 
+
+# ---------------------- 55 EMA Reversal Scanner ----------------------
+FALLBACK_NASDAQ = [
+    "AAPL","MSFT","NVDA","AMZN","GOOGL","GOOG","META","AVGO","TSLA","COST","NFLX","AMD","PEP","ADBE","CSCO","LIN","TMUS","INTU","QCOM","TXN",
+    "AMGN","AMAT","ISRG","HON","BKNG","CMCSA","VRTX","SBUX","PANW","ADP","GILD","MU","ADI","LRCX","MELI","KLAC","CRWD","REGN","MDLZ","SNPS",
+    "CDNS","MAR","PYPL","ABNB","ORLY","CTAS","FTNT","NXPI","WDAY","ROP","PCAR","MNST","TEAM","CHTR","KDP","PAYX","AEP","CPRT","FAST","DDOG",
+    "EXC","CSX","KHC","ODFL","ROST","MRVL","EA","IDXX","VRSK","BKR","XEL","ZS","CCEP","TTD","FANG","DXCM","GEHC","ON","MCHP","BIIB"
+]
+FALLBACK_SP500 = [
+    "AAPL","MSFT","NVDA","AMZN","META","GOOGL","GOOG","BRK-B","LLY","AVGO","JPM","TSLA","XOM","UNH","V","MA","COST","PG","JNJ","HD","ABBV","WMT","NFLX","BAC","KO","ORCL","MRK","CVX","CRM","AMD","PEP","TMO","ADBE","MCD","LIN","CSCO","ABT","ACN","WFC","DIS","IBM","GE","QCOM","CAT","VZ","INTU","AMGN","NOW","TXN","PM","ISRG","NEE","RTX","GS","SPGI","UBER","PFE","BKNG","LOW","AXP","T","UNP","HON","AMAT","BLK","SYK","ETN","TJX","COP","VRTX","LMT","PGR","BSX","C","PANW","ADP","MDT","CB","DE","ADI","GILD","MMC","MU","SBUX","KLAC","LRCX","REGN","PLD","AMT","SO","NKE","ELV","FI","UPS","SCHW","ICE","DUK","CI","MO","WM","ZTS"
+]
+
+def normalize_ticker(t: str) -> str:
+    return str(t).strip().upper().replace(".", "-")
+
+def get_sp500_tickers() -> List[str]:
+    try:
+        tables = pd.read_html("https://en.wikipedia.org/wiki/List_of_S%26P_500_companies")
+        tickers = [normalize_ticker(x) for x in tables[0]["Symbol"].dropna().tolist()]
+        return tickers or FALLBACK_SP500
+    except Exception:
+        return FALLBACK_SP500
+
+def get_nasdaq100_tickers() -> List[str]:
+    try:
+        tables = pd.read_html("https://en.wikipedia.org/wiki/Nasdaq-100")
+        for table in tables:
+            cols = [str(c).lower() for c in table.columns]
+            if any("ticker" in c or "symbol" in c for c in cols):
+                col = table.columns[[("ticker" in str(c).lower() or "symbol" in str(c).lower()) for c in table.columns].index(True)]
+                tickers = [normalize_ticker(x) for x in table[col].dropna().tolist()]
+                if len(tickers) > 30:
+                    return tickers
+    except Exception:
+        pass
+    return FALLBACK_NASDAQ
+
+def get_scan_universe() -> List[str]:
+    tickers = sorted(set(get_sp500_tickers() + get_nasdaq100_tickers()))
+    return [t for t in tickers if t and t not in {"N/A", "nan"}]
+
+def _safe_float(x, default=np.nan) -> float:
+    try:
+        return float(x)
+    except Exception:
+        return default
+
+def _last_bar_by_previous_trading_day(d: pd.DataFrame) -> Tuple[pd.Series, pd.Series]:
+    """30분봉 기준 직전 거래일 마지막 봉과 그 전 거래일 마지막 봉을 반환합니다."""
+    if d is None or d.empty or len(d) < 3:
+        raise ValueError("not enough data")
+    tmp = d.copy()
+    dates = pd.Series(tmp.index).dt.date.values if hasattr(tmp.index, "tz") or hasattr(tmp.index, "date") else pd.to_datetime(tmp.index).date
+    tmp["_date"] = dates
+    unique_dates = list(pd.Series(tmp["_date"]).drop_duplicates())
+    if len(unique_dates) >= 3:
+        yday_date = unique_dates[-2]
+        before_date = unique_dates[-3]
+        yday = tmp[tmp["_date"] == yday_date].iloc[-1]
+        before = tmp[tmp["_date"] == before_date].iloc[-1]
+        return yday, before
+    return tmp.iloc[-2], tmp.iloc[-3]
+
+def ema_reversal_metrics(df: pd.DataFrame) -> Optional[Dict]:
+    # 스코어의 수렴/역전 점수는 30분봉 기준으로 계산합니다.
+    # 8·13은 EMA, 21·55는 SMA입니다.
+    if df is None or df.empty or len(df) < 70:
+        return None
+    d = enrich(df.dropna().copy())
+    last = d.iloc[-1]
+    prev5 = d.iloc[-6] if len(d) >= 6 else d.iloc[0]
+    try:
+        yday, before_yday = _last_bar_by_previous_trading_day(d)
+    except Exception:
+        yday = d.iloc[-2] if len(d) >= 2 else last
+        before_yday = d.iloc[-3] if len(d) >= 3 else prev5
+
+    close = _safe_float(last.get("Close"))
+    ema8, ema13, ma21, ma55 = [_safe_float(last.get(x)) for x in ["EMA8","EMA13","MA21","MA55"]]
+    old8, old13, old21, old55 = [_safe_float(prev5.get(x)) for x in ["EMA8","EMA13","MA21","MA55"]]
+    y8, y13, y21, y55 = [_safe_float(yday.get(x)) for x in ["EMA8","EMA13","MA21","MA55"]]
+    b8, b13, b21, b55 = [_safe_float(before_yday.get(x)) for x in ["EMA8","EMA13","MA21","MA55"]]
+
+    values = [close, ema8, ema13, ma21, ma55, old8, old13, old21, old55, y8, y13, y21, y55, b8, b13, b21, b55]
+    if any(np.isnan(x) for x in values):
+        return None
+
+    # 분석 실행 기준 직전 거래일에 EMA8/EMA13/MA21이 MA55를 아래에서 위로 돌파했는지 확인합니다.
+    crossed_yesterday = {
+        "EMA8": b8 <= b55 and y8 > y55,
+        "EMA13": b13 <= b55 and y13 > y55,
+        "MA21": b21 <= b55 and y21 > y55,
+    }
+    cross_count = sum(1 for v in crossed_yesterday.values() if v)
+    full_yesterday_cross = cross_count == 3
+
+    # 기존 후보 조건: 8/13/21선이 모두 55선 아래에 있고, 최근 5개 30분봉 동안 간격이 좁혀지는 종목
+    below_now = ema8 < ma55 and ema13 < ma55 and ma21 < ma55
+    gaps = np.array([(ma55-ema8)/ma55, (ma55-ema13)/ma55, (ma55-ma21)/ma55])
+    old_gaps = np.array([(old55-old8)/old55, (old55-old13)/old55, (old55-old21)/old55])
+    narrowing = old_gaps.mean() - gaps.mean()
+
+    if not (full_yesterday_cross or (below_now and narrowing > 0)):
+        return None
+
+    signed_gaps = np.array([(ma55-ema8)/ma55, (ma55-ema13)/ma55, (ma55-ma21)/ma55])
+    avg_gap_pct = float(np.abs(signed_gaps).mean() * 100)
+    narrow_pct = float(max(0, narrowing) * 100)
+
+    close_bonus = max(0, 5 - avg_gap_pct) * 1.2
+    narrowing_bonus = min(4, max(0, narrow_pct * 2.5))
+    slope_bonus = 0
+    for now, old in [(ema8, old8), (ema13, old13), (ma21, old21)]:
+        if now > old:
+            slope_bonus += 0.4
+
+    # 최고 가중치: 직전 거래일 30분봉 기준 세 선이 모두 55선을 상향 돌파
+    yesterday_cross_bonus = 30.0 if full_yesterday_cross else cross_count * 6.0
+    base_score = close_bonus + narrowing_bonus + slope_bonus + yesterday_cross_bonus
+
+    if full_yesterday_cross:
+        status = "직전 거래일 8EMA/13EMA/21MA 모두 55MA 상향 돌파"
+    elif cross_count > 0:
+        status = f"직전 거래일 {cross_count}개 선 부분 상향 돌파"
+    else:
+        status = "30분봉 기준 55MA 아래 수렴 중"
+
+    return {
+        "close": close,
+        "ema8": ema8,
+        "ema13": ema13,
+        "ma21": ma21,
+        "ma55": ma55,
+        "avg_gap_pct": avg_gap_pct,
+        "narrowing_pct": narrow_pct,
+        "base_score": float(base_score),
+        "yesterday_cross_bonus": float(yesterday_cross_bonus),
+        "cross_count": int(cross_count),
+        "status": status,
+        "rsi": _safe_float(last.get("RSI14")),
+        "volume": int(_safe_float(last.get("Volume"), 0)),
+    }
+
+def bulk_price_download(tickers: List[str], period="6mo", interval="1d") -> Dict[str, pd.DataFrame]:
+    out = {}
+    if not tickers:
+        return out
+    try:
+        raw = yf.download(tickers, period=period, interval=interval, group_by="ticker", auto_adjust=False, progress=False, threads=True)
+        if raw.empty:
+            return out
+        if isinstance(raw.columns, pd.MultiIndex):
+            for t in tickers:
+                if t in raw.columns.get_level_values(0):
+                    sub = raw[t].dropna()
+                    if not sub.empty:
+                        out[t] = sub
+        else:
+            out[tickers[0]] = raw.dropna()
+    except Exception:
+        # yfinance 대량 다운로드가 실패하면 개별 다운로드로 일부라도 살립니다.
+        for t in tickers:
+            try:
+                sub = yf.download(t, period=period, interval=interval, auto_adjust=False, progress=False)
+                if not sub.empty:
+                    if isinstance(sub.columns, pd.MultiIndex):
+                        sub.columns = sub.columns.get_level_values(0)
+                    out[t] = sub.dropna()
+            except Exception:
+                continue
+    return out
+
+def scan_ema_reversal_candidates(use_news=True, max_candidates=20) -> pd.DataFrame:
+    universe = get_scan_universe()
+    # 먼저 일봉 거래량으로 S&P500 + Nasdaq-100 내 거래량 상위 100개를 고릅니다.
+    daily_prices = bulk_price_download(universe, period="3mo", interval="1d")
+    latest_vols = []
+    for t, df in daily_prices.items():
+        if df is not None and not df.empty and "Volume" in df.columns:
+            latest_vols.append((t, _safe_float(df["Volume"].iloc[-1], 0)))
+    top_volume = [t for t, _ in sorted(latest_vols, key=lambda x: x[1], reverse=True)[:100]]
+    # 수렴/역전 점수는 30분봉 기준으로 다시 계산합니다.
+    prices = bulk_price_download(top_volume, period="60d", interval="30m")
+
+    rows = []
+    for t in top_volume:
+        metrics = ema_reversal_metrics(prices.get(t))
+        if not metrics:
+            continue
+        # 기술 점수는 기존 에이전트 규칙을 재활용합니다.
+        try:
+            tech = technical_score(enrich(prices[t]))
+            tech_score = float(tech.get("score", 0))
+        except Exception:
+            tech_score = 0.0
+        vol_score = 0.0
+        vol_reason = ""
+        try:
+            vs = volume_score(enrich(prices[t]))
+            vol_score = float(vs.get("score", 0))
+            vol_reason = ", ".join(vs.get("reasons", [])[:2])
+        except Exception:
+            pass
+        fund_score = 0.0
+        fund_reason = ""
+        opt_score = 0.0
+        opt_reason = ""
+        news_score = 0.0
+        headlines = []
+        if use_news:
+            try:
+                news = collect_news(t)
+                sent = keyword_sentiment(news)
+                news_score = float(sent.get("score", 0))
+                for section in ["seeking_alpha_signal", "us_economy_news", "company_news"]:
+                    headlines.extend([x.get("title", "") for x in news.get(section, [])[:2] if x.get("title")])
+            except Exception:
+                pass
+            try:
+                fs = fundamental_score(t)
+                fund_score = float(fs.get("score", 0))
+                fund_reason = ", ".join(fs.get("reasons", [])[:2])
+            except Exception:
+                pass
+            try:
+                oscore = options_flow_score(t)
+                opt_score = float(oscore.get("score", 0))
+                opt_reason = ", ".join(oscore.get("reasons", [])[:1])
+            except Exception:
+                pass
+        turtle_score = 0.0
+        turtle_status = ""
+        try:
+            hdf = fetch_hhll_price_preset(t, preset="1mo")
+            tm = turtle_metrics(hdf)
+            turtle_score = float(tm.get("score", 0))
+            turtle_status = tm.get("status", "")
+        except Exception:
+            pass
+        total_score = metrics["base_score"] + tech_score + news_score + turtle_score + vol_score + fund_score + opt_score
+        rows.append({
+            "ticker": t,
+            "score": round(total_score, 2),
+            "수렴/역전점수": round(metrics["base_score"], 2),
+            "터틀점수": round(turtle_score, 2),
+            "터틀상태": turtle_status,
+            "전일역전가점": round(metrics.get("yesterday_cross_bonus", 0), 2),
+            "상태": metrics.get("status", ""),
+            "기술점수": round(tech_score, 2),
+            "뉴스점수": round(news_score, 2),
+            "거래량점수": round(vol_score, 2),
+            "거래량근거": vol_reason,
+            "재무점수": round(fund_score, 2),
+            "재무근거": fund_reason,
+            "옵션수급점수": round(opt_score, 2),
+            "옵션수급근거": opt_reason,
+            "55일선과 평균거리(%)": round(metrics["avg_gap_pct"], 2),
+            "5일간 좁혀진 폭(%)": round(metrics["narrowing_pct"], 2),
+            "종가": round(metrics["close"], 2),
+            "EMA8": round(metrics["ema8"], 2),
+            "EMA13": round(metrics["ema13"], 2),
+            "MA21": round(metrics["ma21"], 2),
+            "MA55": round(metrics["ma55"], 2),
+            "거래량": int(metrics["volume"]),
+            "주요 헤드라인": " | ".join(headlines[:3])
+        })
+    df = pd.DataFrame(rows)
+    if df.empty:
+        return df
+    return df.sort_values("score", ascending=False).head(max_candidates).reset_index(drop=True)
+
 # --------------------------- UI -------------------------------
 def candle_chart(df: pd.DataFrame, ticker: str):
     fig = go.Figure()
-    fig.add_trace(go.Candlestick(x=df.index, open=df["Open"], high=df["High"], low=df["Low"], close=df["Close"], name="Price"))
-    for ma in ["MA20", "MA60", "MA120"]:
-        fig.add_trace(go.Scatter(x=df.index, y=df[ma], mode="lines", name=ma))
-    fig.update_layout(title=f"{ticker} Daily Chart", height=520, margin=dict(l=10,r=10,t=40,b=10), xaxis_rangeslider_visible=False)
+    x = make_compact_x(df)
+    fig.add_trace(go.Candlestick(x=x, open=df["Open"], high=df["High"], low=df["Low"], close=df["Close"], name="Price"))
+    for line_name in ["EMA8", "EMA13", "MA21", "MA55"]:
+        if line_name in df.columns:
+            fig.add_trace(go.Scatter(x=x, y=df[line_name], mode="lines", name=line_name))
+    title_suffix = "분봉" if _is_intraday_index(df.index) else "일봉"
+    fig.update_layout(title=f"{ticker} Chart ({title_suffix})", height=520, margin=dict(l=10,r=10,t=40,b=10), xaxis_rangeslider_visible=False)
+    if _is_intraday_index(df.index):
+        fig.update_xaxes(type="category", nticks=8)
     return fig
 
 def explain_chart(df: pd.DataFrame):
     d = df.tail(180)
     fig = go.Figure()
-    fig.add_trace(go.Scatter(x=d.index, y=d["RSI14"], mode="lines", name="RSI(14)"))
+    x = make_compact_x(d)
+    fig.add_trace(go.Scatter(x=x, y=d["RSI14"], mode="lines", name="RSI(14)"))
     fig.add_hline(y=70, line_dash="dash")
     fig.add_hline(y=30, line_dash="dash")
     fig.update_layout(title="에이전트 설명용 그래프: RSI", height=260, margin=dict(l=10,r=10,t=40,b=10))
+    if _is_intraday_index(d.index):
+        fig.update_xaxes(type="category", nticks=8)
+    return fig
+
+
+def volume_chart(df: pd.DataFrame, ticker: str):
+    d = df.tail(180).copy()
+    fig = go.Figure()
+    x = make_compact_x(d)
+    fig.add_trace(go.Bar(x=x, y=d.get("Volume"), name="Volume"))
+    if "VOL_MA20" in d.columns:
+        fig.add_trace(go.Scatter(x=x, y=d["VOL_MA20"], mode="lines", name="Volume MA20"))
+    fig.update_layout(title=f"{ticker} 거래량·수급 참고 그래프", height=240, margin=dict(l=10,r=10,t=40,b=10))
+    if _is_intraday_index(d.index):
+        fig.update_xaxes(type="category", nticks=8)
+    return fig
+
+def hhll_chart(df: pd.DataFrame, ticker: str, label: str):
+    d = add_hhll(df).dropna().copy()
+    fig = go.Figure()
+    x = make_compact_x(d)
+    fig.add_trace(go.Candlestick(x=x, open=d["Open"], high=d["High"], low=d["Low"], close=d["Close"], name="15분봉 캔들"))
+    fig.add_trace(go.Scatter(x=x, y=d["HH20"], mode="lines", name="Highest High 20"))
+    fig.add_trace(go.Scatter(x=x, y=d["LL10"], mode="lines", name="Lowest Low 10"))
+    # 돌파/이탈 신호 표시
+    try:
+        prev_hh = d["HH20"].shift(1)
+        prev_ll = d["LL10"].shift(1)
+        breakout = d[(d["High"] >= prev_hh) | (d["Close"] > prev_hh)]
+        breakdown = d[(d["Low"] <= prev_ll) | (d["Close"] < prev_ll)]
+        if not breakout.empty:
+            bx = make_compact_x(breakout)
+            fig.add_trace(go.Scatter(x=bx, y=breakout["High"], mode="markers", name="HH20 돌파", marker=dict(symbol="triangle-up", size=9)))
+        if not breakdown.empty:
+            sx = make_compact_x(breakdown)
+            fig.add_trace(go.Scatter(x=sx, y=breakdown["Low"], mode="markers", name="LL10 이탈", marker=dict(symbol="triangle-down", size=9)))
+    except Exception:
+        pass
+    tm = turtle_metrics(df)
+    fig.update_layout(
+        title=f"{ticker} HHLL 터틀트레이딩 참고 차트 · 15분봉 · {label} · 터틀점수 {tm.get('score', 0):.1f} / {tm.get('status', '중립')}",
+        height=420,
+        margin=dict(l=10,r=10,t=40,b=10),
+        xaxis_rangeslider_visible=False,
+    )
+    fig.update_xaxes(type="category", nticks=8)
     return fig
 
 def watchlist_rows():
@@ -257,17 +828,476 @@ def summary_lines(result: Dict, ticker: str) -> List[str]:
     sent = keyword_sentiment(result.get("news", {}) or {})
     tech_score = float(tech.get("score", 0))
     news_score = float(sent.get("score", 0))
-    total_score = float(result.get("score", tech_score + news_score))
+    vol = result.get("volume", {}) or {}
+    fund = result.get("fundamental", {}) or {}
+    opt = result.get("options", {}) or {}
+    vol_score = float(vol.get("score", 0))
+    fund_score = float(fund.get("score", 0))
+    opt_score = float(opt.get("score", 0))
+    total_score = float(result.get("score", tech_score + news_score + vol_score + fund_score + opt_score))
     reasons = tech.get("reasons", []) or []
     reason_text = ", ".join(reasons[:4]) if reasons else "확인 가능한 기술 근거가 부족합니다"
+    turtle = result.get("turtle", {}) or {}
+    turtle_score = float(turtle.get("score", 0))
+    turtle_status = turtle.get("status", "중립")
     return [
-        f"{ticker}의 기술점수는 {tech_score:.1f}, 뉴스 키워드 점수는 {news_score:.1f}입니다.",
+        f"{ticker}의 기술점수는 {tech_score:.1f}, 뉴스 키워드 점수는 {news_score:.1f}, 거래량 점수는 {vol_score:.1f}, 재무점수는 {fund_score:.1f}, 옵션/수급점수는 {opt_score:.1f}, 터틀 점수는 {turtle_score:.1f}입니다.",
         f"핵심 기술 근거는 {reason_text}입니다.",
-        f"시킹알파 관련 헤드라인, 미국 경제뉴스, 기업뉴스를 함께 보면 현재 점수는 {total_score:.1f}로 평가됩니다.",
+        f"거래량 근거는 {', '.join((vol.get('reasons') or [])[:3]) or '거래량 근거 부족'}입니다.",
+        f"실적/밸류 근거는 {', '.join((fund.get('reasons') or [])[:3]) or '재무 근거 부족'}입니다.",
+        f"옵션/수급 참고 근거는 {', '.join((opt.get('reasons') or [])[:2]) or '옵션 데이터 부족'}입니다.",
+        f"HHLL 참고 상태는 {turtle_status}입니다.",
+        f"시킹알파 관련 헤드라인, 미국 경제뉴스, 기업뉴스, 거래량, 재무, 옵션 흐름, HHLL 신호를 함께 보면 현재 점수는 {total_score:.1f}로 평가됩니다.",
         "최근 확인된 주요 헤드라인:",
     ]
 
+
+# ---------------------- V9 Market / Sector / Backtest ----------------------
+MARKET_ETFS = {"S&P500":"SPY", "NASDAQ":"QQQ", "Russell2000":"IWM"}
+SECTOR_ETFS = {"반도체":"SMH", "기술":"XLK", "금융":"XLF", "헬스케어":"XLV", "바이오":"XBI", "제약":"IHE", "로봇":"BOTZ", "AI·로봇":"ROBO", "소비재":"XLY", "에너지":"XLE", "산업재":"XLI", "필수소비재":"XLP", "유틸리티":"XLU", "부동산":"XLRE"}
+
+
+def trend_state_from_df(df: pd.DataFrame) -> Dict:
+    if df is None or df.empty or len(df) < 60:
+        return {"score":0.0,"state":"데이터 부족","reasons":["데이터 부족"]}
+    d=enrich(df.copy()).dropna()
+    if d.empty: return {"score":0.0,"state":"데이터 부족","reasons":["데이터 부족"]}
+    last=d.iloc[-1]
+    score=0.0; reasons=[]
+    close=_safe_float(last.get('Close')); ma20=_safe_float(last.get('MA20')); ma60=_safe_float(last.get('MA60')); ma120=_safe_float(last.get('MA120')); r=_safe_float(last.get('RSI14'))
+    ret20=_safe_float(last.get('RET20'),0)*100
+    if close>ma20: score+=1; reasons.append('20일선 위')
+    else: score-=1; reasons.append('20일선 아래')
+    if close>ma60: score+=1; reasons.append('60일선 위')
+    else: score-=1; reasons.append('60일선 아래')
+    if ma20>ma60: score+=1; reasons.append('20일선>60일선')
+    else: score-=1; reasons.append('20일선<60일선')
+    if ret20>3: score+=0.7; reasons.append(f'20일 수익률 +{ret20:.1f}%')
+    elif ret20<-3: score-=0.7; reasons.append(f'20일 수익률 {ret20:.1f}%')
+    if 45<=r<=65: score+=0.3; reasons.append(f'RSI {r:.1f} 안정')
+    elif r>70: score-=0.3; reasons.append(f'RSI {r:.1f} 과열')
+    state='강세' if score>=2 else '약세' if score<=-1 else '중립'
+    return {"score":round(float(score),2),"state":state,"reasons":reasons,"close":round(float(close),2),"ret20":round(float(ret20),2)}
+
+
+def market_dashboard() -> pd.DataFrame:
+    rows=[]
+    for name,ticker in MARKET_ETFS.items():
+        try:
+            df=fetch_price(ticker, period='8mo', interval='1d')
+            stt=trend_state_from_df(df)
+            rows.append({"시장":name,"티커":ticker,"상태":stt['state'],"시장점수":stt['score'],"20일수익률%":stt.get('ret20',0),"근거":', '.join(stt.get('reasons',[])[:4])})
+        except Exception as e:
+            rows.append({"시장":name,"티커":ticker,"상태":"수집 실패","시장점수":0,"20일수익률%":0,"근거":str(e)[:80]})
+    return pd.DataFrame(rows).sort_values('시장점수', ascending=False)
+
+
+def sector_dashboard() -> pd.DataFrame:
+    rows=[]
+    for name,ticker in SECTOR_ETFS.items():
+        try:
+            df=fetch_price(ticker, period='8mo', interval='1d')
+            stt=trend_state_from_df(df)
+            rows.append({"섹터":name,"ETF":ticker,"상태":stt['state'],"섹터점수":stt['score'],"20일수익률%":stt.get('ret20',0),"근거":', '.join(stt.get('reasons',[])[:4])})
+        except Exception as e:
+            rows.append({"섹터":name,"ETF":ticker,"상태":"수집 실패","섹터점수":0,"20일수익률%":0,"근거":str(e)[:80]})
+    return pd.DataFrame(rows).sort_values(['섹터점수','20일수익률%'], ascending=False)
+
+
+def trade_plan(df: pd.DataFrame) -> Dict:
+    if df is None or df.empty or len(df)<30:
+        return {"entry":None,"stop":None,"target":None,"risk_reward":None}
+    d=add_hhll(enrich(df.copy())).dropna()
+    last=d.iloc[-1]
+    entry=_safe_float(last.get('Close'))
+    stop_candidates=[_safe_float(last.get('LL10')), entry*0.94]
+    stop=max([x for x in stop_candidates if not np.isnan(x) and x<entry], default=entry*0.94)
+    risk=max(entry-stop, entry*0.02)
+    target=entry+risk*2
+    return {"entry":round(float(entry),2),"stop":round(float(stop),2),"target":round(float(target),2),"risk_reward":"1:2"}
+
+
+def simple_backtest(tickers: List[str], max_names:int=30) -> pd.DataFrame:
+    rows=[]
+    for t in tickers[:max_names]:
+        try:
+            df=fetch_price(t, period='2y', interval='1d')
+            if df.empty or len(df)<120: continue
+            d=add_hhll(enrich(df.copy())).dropna().copy()
+            if len(d)<80: continue
+            trades=[]
+            for i in range(60, len(d)-11):
+                row=d.iloc[i]; prev=d.iloc[i-1]
+                signal = (prev['EMA8']<=prev['MA55'] and row['EMA8']>row['MA55']) or (row['Close']>prev['HH20'])
+                if signal:
+                    entry=float(row['Close']); future=d.iloc[i+1:i+11]
+                    if future.empty: continue
+                    stop=float(row['LL10']) if not pd.isna(row['LL10']) else entry*0.94
+                    target=entry+(entry-stop)*2
+                    outcome=float(future['Close'].iloc[-1])
+                    hit_target=(future['High']>=target).any(); hit_stop=(future['Low']<=stop).any()
+                    if hit_target and not hit_stop: ret=(target/entry-1)
+                    elif hit_stop and not hit_target: ret=(stop/entry-1)
+                    else: ret=(outcome/entry-1)
+                    trades.append(ret)
+            if trades:
+                win=sum(1 for x in trades if x>0)/len(trades)*100
+                avg=np.mean(trades)*100
+                rows.append({"티커":t,"거래수":len(trades),"승률%":round(win,1),"평균수익%":round(avg,2),"총점":round(win/10+avg,2)})
+        except Exception:
+            continue
+    return pd.DataFrame(rows).sort_values('총점', ascending=False) if rows else pd.DataFrame()
+
+
+def market_weight() -> float:
+    try:
+        m=market_dashboard()
+        avg=float(m['시장점수'].mean())
+        return 1.15 if avg>=2 else 0.85 if avg<=-1 else 1.0
+    except Exception:
+        return 1.0
+
+
+def ai_report_lines(ticker: str, result: Dict, df: pd.DataFrame) -> List[str]:
+    plan=trade_plan(df)
+    mw=market_weight()
+    adjusted=float(result.get('score',0))*mw
+    return [
+        f"시장 가중치 적용 점수는 {adjusted:.1f}입니다. 현재 시장 가중치는 {mw:.2f}입니다.",
+        f"참고 진입가는 {plan.get('entry')}, 손절가는 {plan.get('stop')}, 1차 목표가는 {plan.get('target')}입니다.",
+        f"리스크 보상비는 {plan.get('risk_reward')} 기준으로 계산했습니다.",
+        "이 가격대는 자동매매 신호가 아니라 차트 기반 참고 계획입니다."
+    ]
+
+
+
+# ---------------------- V10 Portfolio / Risk / Journal ----------------------
+def init_v10_db():
+    con = sqlite3.connect(DB_PATH)
+    cur = con.cursor()
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS trade_journal(
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        ticker TEXT,
+        side TEXT,
+        entry REAL,
+        stop REAL,
+        target REAL,
+        quantity REAL,
+        status TEXT DEFAULT 'OPEN',
+        exit_price REAL,
+        note TEXT,
+        opened_at TEXT,
+        closed_at TEXT
+    )""")
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS portfolio_plans(
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        created_at TEXT,
+        capital REAL,
+        risk_pct REAL,
+        payload TEXT
+    )""")
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS recommendation_log(
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        ticker TEXT,
+        source TEXT,
+        score REAL,
+        entry REAL,
+        recommended_at TEXT,
+        horizon_days INTEGER DEFAULT 30,
+        checked_at TEXT,
+        current_price REAL,
+        return_pct REAL,
+        status TEXT DEFAULT 'OPEN',
+        note TEXT
+    )""")
+    con.commit(); con.close()
+
+
+def _now_text():
+    return dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+
+def max_drawdown(returns: List[float]) -> float:
+    if not returns:
+        return 0.0
+    eq = np.cumprod([1 + r for r in returns])
+    peak = np.maximum.accumulate(eq)
+    dd = (eq / peak - 1) * 100
+    return round(float(dd.min()), 2)
+
+
+def enhanced_backtest(tickers: List[str], max_names:int=30) -> pd.DataFrame:
+    """V10: 승률뿐 아니라 MDD, 손익비, 기대값까지 보는 간단 검증입니다."""
+    rows=[]
+    for t in tickers[:max_names]:
+        try:
+            df=fetch_price(t, period='5y', interval='1d')
+            if df.empty or len(df)<180:
+                continue
+            d=add_hhll(enrich(df.copy())).dropna().copy()
+            trades=[]
+            for i in range(80, len(d)-16):
+                row=d.iloc[i]; prev=d.iloc[i-1]
+                signal = (prev['EMA8']<=prev['MA55'] and row['EMA8']>row['MA55']) or (row['Close']>prev['HH20'])
+                if not signal:
+                    continue
+                entry=float(row['Close'])
+                stop=float(row['LL10']) if not pd.isna(row['LL10']) and row['LL10'] < entry else entry*0.94
+                target=entry+(entry-stop)*2
+                future=d.iloc[i+1:i+16]
+                if future.empty:
+                    continue
+                ret=None
+                for _, f in future.iterrows():
+                    if float(f['Low']) <= stop:
+                        ret=stop/entry-1; break
+                    if float(f['High']) >= target:
+                        ret=target/entry-1; break
+                if ret is None:
+                    ret=float(future['Close'].iloc[-1])/entry-1
+                trades.append(ret)
+            if trades:
+                wins=[x for x in trades if x>0]; losses=[x for x in trades if x<=0]
+                win_rate=len(wins)/len(trades)*100
+                avg=np.mean(trades)*100
+                profit_factor=(sum(wins)/abs(sum(losses))) if losses and abs(sum(losses))>0 else np.nan
+                mdd=max_drawdown(trades)
+                expectancy=np.mean(trades)*100
+                rows.append({"티커":t,"거래수":len(trades),"승률%":round(win_rate,1),"평균수익%":round(avg,2),"기대값%":round(expectancy,2),"Profit Factor":round(float(profit_factor),2) if not np.isnan(profit_factor) else None,"MDD%":mdd,"검증점수":round(win_rate/10+expectancy+(0 if np.isnan(profit_factor) else min(profit_factor,3)),2)})
+        except Exception:
+            continue
+    return pd.DataFrame(rows).sort_values('검증점수', ascending=False) if rows else pd.DataFrame()
+
+
+def position_size_from_plan(capital: float, risk_pct: float, entry: float, stop: float) -> Dict:
+    if not entry or not stop or entry <= stop or capital <= 0:
+        return {"risk_amount":0,"quantity":0,"position_value":0,"weight_pct":0}
+    risk_amount = capital * risk_pct / 100
+    unit_risk = entry - stop
+    qty = max(0, int(risk_amount / unit_risk))
+    position_value = qty * entry
+    return {"risk_amount":round(risk_amount,2),"quantity":qty,"position_value":round(position_value,2),"weight_pct":round(position_value/capital*100,2) if capital else 0}
+
+
+def build_portfolio_plan(source_df: pd.DataFrame, capital: float, max_positions:int=8, risk_pct:float=1.0) -> pd.DataFrame:
+    if source_df is None or source_df.empty or capital <= 0:
+        return pd.DataFrame()
+    df = source_df.copy()
+    score_col = 'score' if 'score' in df.columns else '총점' if '총점' in df.columns else '검증점수' if '검증점수' in df.columns else None
+    ticker_col = 'ticker' if 'ticker' in df.columns else '티커' if '티커' in df.columns else None
+    if not ticker_col:
+        return pd.DataFrame()
+    if score_col:
+        df = df.sort_values(score_col, ascending=False)
+    df = df.head(max_positions)
+    rows=[]
+    if score_col:
+        total_score = max(float(df[score_col].fillna(0).clip(lower=0).sum()), 1.0)
+    else:
+        total_score = max(len(df), 1)
+    for _, r in df.iterrows():
+        t=str(r[ticker_col])
+        try:
+            price_df=fetch_price(t, period='6mo', interval='1d')
+            plan=trade_plan(price_df)
+            entry=plan.get('entry'); stop=plan.get('stop'); target=plan.get('target')
+            ps=position_size_from_plan(capital, risk_pct, entry, stop)
+            s=float(r[score_col]) if score_col and pd.notna(r[score_col]) else 1.0
+            score_weight=round(max(s,0)/total_score*100,2)
+            rows.append({"티커":t,"점수":round(s,2),"점수비중%":score_weight,"참고진입가":entry,"손절가":stop,"목표가":target,"권장수량":ps['quantity'],"포지션금액":ps['position_value'],"계좌비중%":ps['weight_pct'],"1회위험금액":ps['risk_amount']})
+        except Exception:
+            continue
+    return pd.DataFrame(rows)
+
+
+def save_portfolio_plan(df: pd.DataFrame, capital: float, risk_pct: float):
+    if df is None or df.empty:
+        return
+    db_execute("INSERT INTO portfolio_plans(created_at, capital, risk_pct, payload) VALUES(?,?,?,?)", (_now_text(), float(capital), float(risk_pct), df.to_json(orient='records', force_ascii=False)))
+
+
+def add_trade_journal(ticker, side, entry, stop, target, quantity, note=""):
+    db_execute("""INSERT INTO trade_journal(ticker,side,entry,stop,target,quantity,status,note,opened_at)
+                VALUES(?,?,?,?,?,?,?,?,?)""", (ticker, side, float(entry), float(stop), float(target), float(quantity), 'OPEN', note, _now_text()))
+
+
+def close_trade_journal(row_id:int, exit_price:float):
+    db_execute("UPDATE trade_journal SET status='CLOSED', exit_price=?, closed_at=? WHERE id=?", (float(exit_price), _now_text(), int(row_id)))
+
+
+def journal_df() -> pd.DataFrame:
+    rows=db_execute("SELECT id,ticker,side,entry,stop,target,quantity,status,exit_price,note,opened_at,closed_at FROM trade_journal ORDER BY id DESC", fetch=True)
+    cols=['id','티커','방향','진입가','손절가','목표가','수량','상태','청산가','메모','진입일','청산일']
+    df=pd.DataFrame(rows, columns=cols)
+    if not df.empty:
+        df['손익%']=df.apply(lambda r: round(((r['청산가'] if pd.notna(r['청산가']) else r['진입가'])/r['진입가']-1)*100,2) if r['진입가'] else 0, axis=1)
+        df['손익금']=df.apply(lambda r: round((((r['청산가'] if pd.notna(r['청산가']) else r['진입가'])-r['진입가'])*r['수량']),2) if r['진입가'] else 0, axis=1)
+    return df
+
+
+def watchlist_source_df() -> pd.DataFrame:
+    rows=watchlist_rows()
+    out=[]
+    for t,*_ in rows:
+        sc=get_today_score(t)
+        if sc is not None:
+            out.append({'ticker':t,'score':float(sc)})
+    return pd.DataFrame(out).sort_values('score', ascending=False) if out else pd.DataFrame()
+
+
+
+# ---------------------- V11 Regime / Rotation / Learning ----------------------
+def classify_market_regime() -> Dict:
+    """Risk On/Off보다 조금 더 세분화한 시장 체제 엔진입니다."""
+    try:
+        spy = trend_state_from_df(fetch_price('SPY', period='1y', interval='1d'))
+        qqq = trend_state_from_df(fetch_price('QQQ', period='1y', interval='1d'))
+        iwm = trend_state_from_df(fetch_price('IWM', period='1y', interval='1d'))
+        vix_df = fetch_price('^VIX', period='6mo', interval='1d')
+        vix = _safe_float(vix_df['Close'].iloc[-1], 20) if vix_df is not None and not vix_df.empty else 20
+        avg = float(np.mean([spy.get('score',0), qqq.get('score',0), iwm.get('score',0)]))
+        if vix >= 28 or avg <= -1.5:
+            regime = 'Risk Off / 방어'
+            weight = 0.65
+            guide = '신규 매수는 줄이고, 현금 비중과 손절 기준을 보수적으로 둡니다.'
+        elif avg >= 2.0 and vix < 20:
+            regime = 'Risk On / 추세 강세'
+            weight = 1.20
+            guide = '돌파·추세추종 전략의 신뢰도가 높아지는 구간입니다.'
+        elif avg >= 0.5:
+            regime = '회복·선별장'
+            weight = 1.05
+            guide = '섹터 강도와 거래량이 동반되는 종목만 선별합니다.'
+        elif avg <= -0.5:
+            regime = '조정·경계'
+            weight = 0.85
+            guide = '반등 후보는 보되, 포지션 크기를 낮춥니다.'
+        else:
+            regime = '중립·횡보'
+            weight = 1.00
+            guide = '개별 종목 모멘텀과 손절 관리가 중요합니다.'
+        return {'시장체제': regime, '시장가중치': round(weight,2), '평균시장점수': round(avg,2), 'VIX': round(float(vix),2), '운용가이드': guide}
+    except Exception as e:
+        return {'시장체제':'판단 실패', '시장가중치':1.0, '평균시장점수':0.0, 'VIX':None, '운용가이드':str(e)[:80]}
+
+
+def sector_rotation_dashboard() -> pd.DataFrame:
+    """섹터 로테이션: 20일/60일 상대강도와 추세를 섞어 순위화합니다. 바이오·제약·로봇 포함."""
+    rows=[]
+    try:
+        spy = fetch_price('SPY', period='1y', interval='1d')
+        spy_ret20 = _safe_float(spy['Close'].pct_change(20).iloc[-1], 0) if spy is not None and not spy.empty else 0
+        spy_ret60 = _safe_float(spy['Close'].pct_change(60).iloc[-1], 0) if spy is not None and not spy.empty else 0
+    except Exception:
+        spy_ret20=spy_ret60=0
+    for name, ticker in SECTOR_ETFS.items():
+        try:
+            df=fetch_price(ticker, period='1y', interval='1d')
+            if df.empty or len(df)<70:
+                continue
+            stt=trend_state_from_df(df)
+            ret20=_safe_float(df['Close'].pct_change(20).iloc[-1],0)*100
+            ret60=_safe_float(df['Close'].pct_change(60).iloc[-1],0)*100
+            rel20=ret20 - spy_ret20*100
+            rel60=ret60 - spy_ret60*100
+            rotation_score=stt['score'] + rel20/5 + rel60/10
+            phase = '주도' if rotation_score>=3 else '개선' if rotation_score>=1 else '약화' if rotation_score<=-1 else '중립'
+            rows.append({'섹터':name,'ETF':ticker,'로테이션단계':phase,'로테이션점수':round(float(rotation_score),2),'섹터점수':stt['score'],'20일상대강도%':round(rel20,2),'60일상대강도%':round(rel60,2),'근거':', '.join(stt.get('reasons',[])[:3])})
+        except Exception:
+            continue
+    return pd.DataFrame(rows).sort_values(['로테이션점수','20일상대강도%'], ascending=False) if rows else pd.DataFrame()
+
+
+def save_recommendations_from_df(df: pd.DataFrame, source: str='scanner', horizon_days:int=30):
+    if df is None or df.empty:
+        return
+    ticker_col = 'ticker' if 'ticker' in df.columns else '티커' if '티커' in df.columns else None
+    score_col = 'score' if 'score' in df.columns else '검증점수' if '검증점수' in df.columns else '총점' if '총점' in df.columns else None
+    if not ticker_col:
+        return
+    today = dt.datetime.now().strftime('%Y-%m-%d')
+    for _, r in df.head(50).iterrows():
+        t=str(r[ticker_col]).strip().upper()
+        exists=db_execute("SELECT id FROM recommendation_log WHERE ticker=? AND source=? AND substr(recommended_at,1,10)=?", (t, source, today), fetch=True)
+        if exists:
+            continue
+        try:
+            px=fetch_price(t, period='5d', interval='1d')
+            entry=_safe_float(px['Close'].iloc[-1],0) if px is not None and not px.empty else 0
+            score=float(r[score_col]) if score_col and pd.notna(r[score_col]) else 0.0
+            db_execute("INSERT INTO recommendation_log(ticker,source,score,entry,recommended_at,horizon_days,note) VALUES(?,?,?,?,?,?,?)", (t, source, score, entry, _now_text(), int(horizon_days), '자동 추천 저장'))
+        except Exception:
+            continue
+
+
+def recommendation_log_df() -> pd.DataFrame:
+    rows=db_execute("SELECT id,ticker,source,score,entry,recommended_at,horizon_days,checked_at,current_price,return_pct,status,note FROM recommendation_log ORDER BY id DESC", fetch=True)
+    cols=['id','티커','소스','추천점수','추천가','추천일','검증일수','확인일','현재가','수익률%','상태','메모']
+    return pd.DataFrame(rows, columns=cols)
+
+
+def verify_recommendations(force: bool=False) -> int:
+    rows=db_execute("SELECT id,ticker,entry,recommended_at,horizon_days,status FROM recommendation_log WHERE status='OPEN'", fetch=True)
+    updated=0
+    now=dt.datetime.now()
+    for row_id,ticker,entry,rec_at,horizon,status in rows:
+        try:
+            rec_dt=dt.datetime.strptime(rec_at[:10], '%Y-%m-%d')
+            if (now-rec_dt).days < int(horizon) and not force:
+                continue
+            df=fetch_price(ticker, period='5d', interval='1d')
+            if df is None or df.empty or not entry:
+                continue
+            current=_safe_float(df['Close'].iloc[-1],0)
+            ret=(current/float(entry)-1)*100 if entry else 0
+            db_execute("UPDATE recommendation_log SET checked_at=?, current_price=?, return_pct=?, status=? WHERE id=?", (_now_text(), current, round(ret,2), 'CHECKED', int(row_id)))
+            updated+=1
+        except Exception:
+            continue
+    return updated
+
+
+def recommendation_performance_df() -> pd.DataFrame:
+    df=recommendation_log_df()
+    if df.empty:
+        return pd.DataFrame()
+    checked=df[df['상태']=='CHECKED'].copy()
+    if checked.empty:
+        return pd.DataFrame()
+    checked['win']=checked['수익률%']>0
+    rows=[]
+    for src,g in checked.groupby('소스'):
+        rows.append({'소스':src,'검증건수':len(g),'승률%':round(g['win'].mean()*100,1),'평균수익률%':round(g['수익률%'].mean(),2),'누적수익률%':round(g['수익률%'].sum(),2)})
+    rows.append({'소스':'전체','검증건수':len(checked),'승률%':round(checked['win'].mean()*100,1),'평균수익률%':round(checked['수익률%'].mean(),2),'누적수익률%':round(checked['수익률%'].sum(),2)})
+    return pd.DataFrame(rows).sort_values('평균수익률%', ascending=False)
+
+
+def ai_investment_journal_text() -> List[str]:
+    regime=classify_market_regime()
+    perf=recommendation_performance_df()
+    jdf=journal_df()
+    lines=[]
+    lines.append(f"현재 시장 체제는 {regime.get('시장체제')}입니다. 시장 가중치는 {regime.get('시장가중치')}이고, VIX는 {regime.get('VIX')}입니다.")
+    lines.append(regime.get('운용가이드',''))
+    if isinstance(perf, pd.DataFrame) and not perf.empty:
+        total=perf[perf['소스']=='전체'].iloc[0]
+        lines.append(f"자동 추천 검증 결과는 총 {int(total['검증건수'])}건, 승률 {total['승률%']}%, 평균수익률 {total['평균수익률%']}%입니다.")
+    if isinstance(jdf, pd.DataFrame) and not jdf.empty:
+        open_n=len(jdf[jdf['상태']=='OPEN'])
+        closed=jdf[jdf['상태']=='CLOSED']
+        if not closed.empty:
+            lines.append(f"매매일지 기준 청산 거래 승률은 {round((closed['손익%']>0).mean()*100,1)}%, 총손익은 {closed['손익금'].sum():,.0f}입니다. 현재 미청산 포지션은 {open_n}개입니다.")
+        else:
+            lines.append(f"현재 미청산 포지션은 {open_n}개입니다. 아직 청산된 거래가 부족해 성과 평가는 제한적입니다.")
+    else:
+        lines.append("매매일지가 아직 비어 있습니다. 실제 매수·청산 기록을 쌓아야 전략의 강점과 약점을 학습할 수 있습니다.")
+    return lines
+
 init_db()
+init_v10_db()
 st.set_page_config(page_title="Stock Agent Pro", page_icon="📈", layout="wide")
 st.markdown("""
 <style>
@@ -287,7 +1317,189 @@ h3{font-size:1.25rem !important;}
 """, unsafe_allow_html=True)
 if "selected_ticker" not in st.session_state:
     st.session_state.selected_ticker = "TSLA"
-st.title("📈 Stock Agent Pro — 차트 + 매수/매도 에이전트")
+
+
+# ---------------------- V12 Adaptive OS / Options / Alerts ----------------------
+def init_v12_db():
+    """V12: 자동 가중치, 알림, 성과 학습을 위한 추가 테이블."""
+    db_execute("""CREATE TABLE IF NOT EXISTS adaptive_weights(
+        id INTEGER PRIMARY KEY CHECK(id=1),
+        technical REAL DEFAULT 1.0,
+        news REAL DEFAULT 1.0,
+        volume REAL DEFAULT 1.0,
+        turtle REAL DEFAULT 1.0,
+        sector REAL DEFAULT 1.0,
+        regime REAL DEFAULT 1.0,
+        updated_at TEXT
+    )""")
+    db_execute("""INSERT OR IGNORE INTO adaptive_weights(id, technical, news, volume, turtle, sector, regime, updated_at)
+                VALUES(1,1,1,1,1,1,1,?)""", (_now_text(),))
+    db_execute("""CREATE TABLE IF NOT EXISTS alert_log(
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        ticker TEXT,
+        alert_type TEXT,
+        message TEXT,
+        score REAL,
+        created_at TEXT
+    )""")
+
+def get_adaptive_weights() -> Dict:
+    init_v12_db()
+    rows = db_execute("SELECT technical,news,volume,turtle,sector,regime,updated_at FROM adaptive_weights WHERE id=1", fetch=True)
+    if not rows:
+        return {"technical":1,"news":1,"volume":1,"turtle":1,"sector":1,"regime":1,"updated_at":""}
+    r = rows[0]
+    return {"technical":r[0],"news":r[1],"volume":r[2],"turtle":r[3],"sector":r[4],"regime":r[5],"updated_at":r[6]}
+
+def update_adaptive_weights() -> Dict:
+    """추천 성과를 이용해 가중치를 보수적으로 자동 조정. 데이터가 적으면 기본값 유지."""
+    init_v12_db()
+    log = recommendation_log_df()
+    if log is None or log.empty or '수익률%' not in log.columns:
+        return get_adaptive_weights()
+    checked = log.dropna(subset=['수익률%']).copy()
+    if len(checked) < 5:
+        return get_adaptive_weights()
+    avg_ret = float(checked['수익률%'].tail(50).mean())
+    win = float((checked['수익률%'].tail(50) > 0).mean())
+    # 단순하지만 과최적화를 피하기 위해 0.75~1.35 범위로 제한
+    boost = max(0.75, min(1.35, 1.0 + avg_ret/25.0 + (win-0.5)*0.45))
+    # 최근 성과가 좋으면 추세·터틀·거래량 비중 확대, 나쁘면 방어적으로 낮춤
+    technical = round(max(0.75, min(1.35, boost)), 2)
+    volume = round(max(0.75, min(1.35, 1.0 + (boost-1)*0.9)), 2)
+    turtle = round(max(0.75, min(1.35, 1.0 + (boost-1)*1.1)), 2)
+    news = round(max(0.75, min(1.25, 1.0 + (boost-1)*0.55)), 2)
+    sector = round(max(0.80, min(1.30, 1.0 + (boost-1)*0.75)), 2)
+    regime = round(max(0.80, min(1.30, 1.0 + (boost-1)*0.85)), 2)
+    db_execute("UPDATE adaptive_weights SET technical=?,news=?,volume=?,turtle=?,sector=?,regime=?,updated_at=? WHERE id=1",
+               (technical, news, volume, turtle, sector, regime, _now_text()))
+    return get_adaptive_weights()
+
+def classify_market_regime() -> Dict:
+    """V12: Risk On/Off, Panic, Recovery, Euphoria를 나누는 시장 체제 엔진."""
+    try:
+        tickers = {'SPY':'S&P500','QQQ':'NASDAQ','IWM':'Russell2000'}
+        states=[]
+        for t,n in tickers.items():
+            d=fetch_price(t, period='1y', interval='1d')
+            states.append(trend_state_from_df(d).get('score',0))
+        vix_df=fetch_price('^VIX', period='6mo', interval='1d')
+        vix=_safe_float(vix_df['Close'].iloc[-1],20) if vix_df is not None and not vix_df.empty else 20
+        avg=float(np.mean(states))
+        qqq20=fetch_price('QQQ', period='3mo', interval='1d')
+        ret20=float(qqq20['Close'].pct_change(20).iloc[-1]*100) if qqq20 is not None and len(qqq20)>25 else 0
+        if vix >= 32 or avg <= -2.0:
+            regime='Panic / 위험회피 극대화'; weight=0.50; cash=55
+        elif avg < -0.75 or vix >= 24:
+            regime='Risk Off / 약세·방어'; weight=0.70; cash=40
+        elif ret20 > 8 and vix < 16 and avg >= 2.0:
+            regime='Euphoria / 과열 강세'; weight=0.95; cash=25
+        elif avg >= 1.4 and vix < 22:
+            regime='Risk On / 추세 강세'; weight=1.20; cash=10
+        elif ret20 > 3 and avg > 0:
+            regime='Recovery / 회복 초입'; weight=1.10; cash=20
+        else:
+            regime='Neutral / 관망'; weight=0.90; cash=30
+        return {'시장체제':regime,'시장가중치':round(weight,2),'평균시장점수':round(avg,2),'VIX':round(vix,2),'권장현금비중%':cash,
+                '운용가이드':f'{regime}: 후보 점수에 시장가중치 {weight:.2f}를 적용하고 현금 {cash}%를 기준으로 포트폴리오 위험을 조절합니다.'}
+    except Exception as e:
+        return {'시장체제':'데이터 부족','시장가중치':0.9,'평균시장점수':0,'VIX':0,'권장현금비중%':30,'운용가이드':str(e)}
+
+def option_flow_score(ticker: str) -> Dict:
+    """Yahoo Finance 옵션 체인을 활용한 간단 콜/풋 흐름 점수."""
+    try:
+        tk=yf.Ticker(ticker)
+        expiries=list(tk.options or [])
+        if not expiries:
+            return {'score':0.0,'call_put_ratio':None,'comment':'옵션 데이터 없음'}
+        opt=tk.option_chain(expiries[0])
+        call_vol=float(opt.calls.get('volume',pd.Series(dtype=float)).fillna(0).sum())
+        put_vol=float(opt.puts.get('volume',pd.Series(dtype=float)).fillna(0).sum())
+        ratio=call_vol/max(put_vol,1.0)
+        score=max(-1.5, min(1.5, (ratio-1.0)))
+        return {'score':round(score,2),'call_put_ratio':round(ratio,2),'comment':f'최근 만기 콜/풋 거래량 비율 {ratio:.2f}'}
+    except Exception:
+        return {'score':0.0,'call_put_ratio':None,'comment':'옵션 데이터 수집 실패'}
+
+def apply_adaptive_weights(df: pd.DataFrame) -> pd.DataFrame:
+    if df is None or df.empty:
+        return df
+    w=get_adaptive_weights()
+    d=df.copy()
+    # 존재하는 점수 컬럼만 재가중. 원점수도 보존.
+    d['raw_score']=d['score'] if 'score' in d.columns else (d['총점'] if '총점' in d.columns else (d['검증점수'] if '검증점수' in d.columns else 0))
+    score=pd.Series(0.0,index=d.index)
+    mapping=[
+        ('technical_score','technical'),('기술점수','technical'),('SLA기술점수','technical'),('기술','technical'),
+        ('news_score','news'),('뉴스점수','news'),('뉴스 키워드 점수','news'),('뉴스','news'),
+        ('volume_score','volume'),('거래량점수','volume'),('수급점수','volume'),('수급','volume'),
+        ('turtle_score','turtle'),('터틀점수','turtle'),('HHLL점수','turtle'),
+        ('sector_score','sector'),('섹터점수','sector'),('로테이션점수','sector'),
+        ('시장점수','regime'),('시장가중치','regime')
+    ]
+    used=False
+    for col,key in mapping:
+        if col in d.columns:
+            score += pd.to_numeric(d[col], errors='coerce').fillna(0) * float(w.get(key,1))
+            used=True
+    # 기존 score만 있는 경우는 시장체제만 반영
+    total_col = 'score' if 'score' in d.columns else ('총점' if '총점' in d.columns else ('검증점수' if '검증점수' in d.columns else None))
+    if not used and total_col:
+        score=pd.to_numeric(d[total_col], errors='coerce').fillna(0) * float(w.get('regime',1))
+    elif total_col:
+        # 수렴/역전 등 기존 통합점수의 정보 손실 방지를 위해 일부 반영
+        score += pd.to_numeric(d[total_col], errors='coerce').fillna(0) * 0.35
+    regime=classify_market_regime()
+    score = score * float(regime.get('시장가중치',1))
+    d['v12_score']=score.round(2)
+    d=d.sort_values('v12_score', ascending=False)
+    return d
+
+def optimize_portfolio_v12(source_df: pd.DataFrame, capital: float, max_positions:int=8, risk_pct:float=1.0) -> pd.DataFrame:
+    """점수 기반 + 시장체제 현금비중을 적용한 간단 포트폴리오 최적화."""
+    if source_df is None or source_df.empty:
+        return pd.DataFrame()
+    d=apply_adaptive_weights(source_df).head(max_positions).copy()
+    if d.empty:
+        return d
+    regime=classify_market_regime()
+    invest_capital=capital * (1 - float(regime.get('권장현금비중%',30))/100)
+    s=pd.to_numeric(d.get('v12_score', d.get('score', 1)), errors='coerce').fillna(1).clip(lower=0.1)
+    weights=s/s.sum()
+    rows=[]
+    for idx,row in d.iterrows():
+        t=str(row.get('ticker') or row.get('티커') or row.get('종목') or row.get('ticker',''))
+        try:
+            px=fetch_price(t, period='3mo', interval='1d')['Close'].iloc[-1]
+        except Exception:
+            px=np.nan
+        alloc=float(invest_capital*weights.loc[idx])
+        qty=int(alloc/px) if px and not pd.isna(px) and px>0 else 0
+        rows.append({'ticker':t,'v12_score':float(s.loc[idx]),'비중%':round(float(weights.loc[idx])*100,2),'배정금액':round(alloc,2),'현재가':round(float(px),2) if px==px else None,'권장수량':qty,'시장체제':regime.get('시장체제')})
+    return pd.DataFrame(rows)
+
+def detect_alerts_v12(tickers: List[str]) -> pd.DataFrame:
+    alerts=[]
+    for t in tickers[:80]:
+        try:
+            d=fetch_hhll_price_preset(t, '1d')
+            tm=turtle_metrics(d)
+            daily=fetch_price(t, period='6mo', interval='1d')
+            ts=technical_score(daily).get('score',0) if daily is not None and not daily.empty else 0
+            if tm.get('hh_breakout') or ts>=3:
+                msg = 'HH20 돌파' if tm.get('hh_breakout') else '기술점수 강세'
+                score=float(tm.get('score',0))+float(ts)
+                alerts.append({'ticker':t,'alert':msg,'score':round(score,2),'time':_now_text()})
+                db_execute("INSERT INTO alert_log(ticker,alert_type,message,score,created_at) VALUES(?,?,?,?,?)", (t,msg,msg,score,_now_text()))
+        except Exception:
+            continue
+    return pd.DataFrame(alerts).sort_values('score',ascending=False) if alerts else pd.DataFrame()
+
+def alert_log_df() -> pd.DataFrame:
+    rows=db_execute("SELECT ticker,alert_type,message,score,created_at FROM alert_log ORDER BY id DESC LIMIT 200", fetch=True)
+    return pd.DataFrame(rows, columns=['ticker','alert','message','score','created_at']) if rows else pd.DataFrame()
+
+st.title("📈 Stock Agent Pro V12 — AI 자동학습 투자 OS")
 st.caption("관심그룹은 매일 1회 자동 캐시 분석, 비관심 종목은 분석 버튼 클릭 시에만 분석됩니다. Seeking Alpha는 RSS/검색 헤드라인 기반으로 참고합니다.")
 
 with st.sidebar:
@@ -300,15 +1512,23 @@ with st.sidebar:
     st.divider()
     rows = watchlist_rows()
     st.write("관심그룹")
+    if "delete_selected" not in st.session_state:
+        st.session_state.delete_selected = {}
     for t, name, g, upd in rows:
         score = get_today_score(t)
-        col_a, col_b = st.columns([4, 1])
+        col_chk, col_a, col_b = st.columns([0.35, 3.65, 1])
+        st.session_state.delete_selected[t] = col_chk.checkbox("", value=st.session_state.delete_selected.get(t, False), key=f"chk_{g}_{t}", label_visibility="collapsed")
         if col_a.button(f"{g} · {t}", key=f"select_{g}_{t}", width="stretch"):
             st.session_state.selected_ticker = t
             st.rerun()
         col_b.markdown(score_badge_html(score), unsafe_allow_html=True)
-        if st.button("삭제", key=f"del_{g}_{t}"):
-            remove_watch(t); st.rerun()
+    if rows:
+        if st.button("선택 종목 삭제", type="secondary", width="stretch"):
+            selected = [t for t, checked in st.session_state.delete_selected.items() if checked]
+            for t in selected:
+                remove_watch(t)
+            st.session_state.delete_selected = {}
+            st.rerun()
     st.divider()
     if st.button("관심그룹 Daily 업그레이드 실행"):
         for t, *_ in rows:
@@ -316,54 +1536,299 @@ with st.sidebar:
                 run_analysis(t, use_llm=use_llm, force=True)
         st.success("업데이트 완료")
 
-left, right = st.columns([1.35, 0.9], gap="large")
+main_tab, scanner_tab, market_tab, backtest_tab, portfolio_tab, journal_tab, learning_tab, v12_tab = st.tabs(["종목 차트·에이전트", "55일선 역전 후보", "시장·섹터·로테이션", "백테스트", "포트폴리오", "매매일지", "성과학습", "V12 자동학습"])
 
-with left:
-    st.subheader("종목 검색 차트")
-    ticker = st.text_input("티커 검색", value=st.session_state.selected_ticker).upper().strip()
-    st.session_state.selected_ticker = ticker
-    period = st.selectbox("기간", ["6mo", "1y", "2y", "5y"], index=0)
-    df = fetch_price(ticker, period=period)
-    if not df.empty:
-        st.plotly_chart(candle_chart(df, ticker), width="stretch")
-        st.subheader("에이전트 설명용 그래프")
-        st.plotly_chart(explain_chart(df), width="stretch")
+with main_tab:
+    left, right = st.columns([1.35, 0.9], gap="large")
+
+    with left:
+        st.subheader("종목 검색 차트")
+        ticker = st.text_input("티커 검색", value=st.session_state.selected_ticker).upper().strip()
+        st.session_state.selected_ticker = ticker
+        period = st.selectbox("기간", ["6mo", "1mo", "1wk", "1d", "30m", "1y", "2y", "5y"], index=0)
+        df = fetch_price_preset(ticker, preset=period)
+        if not df.empty:
+            st.plotly_chart(candle_chart(df, ticker), width="stretch")
+            st.subheader("에이전트 설명용 그래프")
+            st.plotly_chart(explain_chart(df), width="stretch")
+            st.plotly_chart(volume_chart(df, ticker), width="stretch")
+
+            st.subheader("HHLL 터틀트레이딩 참고 차트")
+            hhll_period = st.selectbox("HHLL 기간", ["6mo", "1mo", "1wk", "1d"], index=1)
+            hhll_df = fetch_hhll_price_preset(ticker, preset=hhll_period)
+            if not hhll_df.empty and len(hhll_df) >= 25:
+                st.plotly_chart(hhll_chart(hhll_df, ticker, hhll_period), width="stretch")
+                if hhll_period == "6mo":
+                    st.caption("15분봉 장기 데이터는 데이터 제공처 제한으로 실제 표시 범위가 최근 약 60일로 줄어들 수 있습니다.")
+            else:
+                st.warning("HHLL 15분봉 데이터를 충분히 가져오지 못했습니다.")
+        else:
+            st.error("차트 데이터를 가져오지 못했습니다.")
+
+    with right:
+        st.subheader("에이전트 매수/매도 의견")
+        is_watch = ticker in [r[0] for r in rows]
+        cached = load_analysis(ticker)
+        if is_watch and not cached:
+            with st.spinner("관심종목이라 오늘 분석을 자동 실행합니다..."):
+                result = run_analysis(ticker, use_llm=use_llm)
+        elif cached:
+            result = json.loads(cached[3])
+        else:
+            result = None
+
+        if st.button("🔎 지금 분석", type="primary"):
+            with st.spinner("뉴스와 차트를 종합 분석 중..."):
+                result = run_analysis(ticker, use_llm=use_llm, force=True)
+
+        if result:
+            op = result["opinion"]
+            st.metric("의견", op, f"score {result['score']:.1f}")
+            st.markdown("**분석 결과**")
+            for line in summary_lines(result, ticker):
+                st.write(f"• {line}")
+
+            st.markdown("**V9 실전 리포트**")
+            try:
+                for line in ai_report_lines(ticker, result, df):
+                    st.write(f"• {line}")
+            except Exception:
+                pass
+
+            st.markdown("**수집한 뉴스 헤드라인**")
+            news = result.get("news", {})
+            for section, title in [("seeking_alpha_signal", "Seeking Alpha"), ("us_economy_news", "미국 경제뉴스"), ("company_news", "기업뉴스")]:
+                st.markdown(f"_{title}_")
+                for item in news.get(section, [])[:6]:
+                    headline = item.get("title", "")
+                    link = item.get("link", "")
+                    if link:
+                        st.markdown(f"- [{headline}]({link})")
+                    else:
+                        st.write(f"- {headline}")
+        else:
+            st.info("관심그룹이 아닌 종목은 ‘🔎 지금 분석’을 눌러야 분석됩니다.")
+
+with scanner_tab:
+    st.subheader("55일선 역전 후보 스캐너")
+    st.caption("S&P500과 Nasdaq-100 종목 중 거래량 상위 100개를 분석합니다. score는 30분봉 수렴/역전 + 기술 + 뉴스 + 거래량 + 재무 + 옵션/수급 + 15분봉 터틀 점수를 합산합니다.")
+    col1, col2, col3 = st.columns([1, 1, 2])
+    use_news_scan = col1.toggle("뉴스 점수 포함", value=True)
+    max_result = col2.selectbox("추천 개수", [20, 50], index=0)
+    run_scan = col3.button("📊 후보 종목 분석 실행", type="primary", width="stretch")
+
+    if run_scan:
+        with st.spinner("거래량 상위 100개 종목과 EMA 수렴도를 분석 중입니다. 뉴스 점수 포함 시 시간이 더 걸릴 수 있습니다..."):
+            scan_df = scan_ema_reversal_candidates(use_news=use_news_scan, max_candidates=int(max_result))
+            scan_df = apply_adaptive_weights(scan_df)
+        st.session_state["scan_df"] = scan_df
+        save_recommendations_from_df(scan_df, source="scanner", horizon_days=30)
+
+    scan_df = st.session_state.get("scan_df")
+    if isinstance(scan_df, pd.DataFrame) and not scan_df.empty:
+        st.markdown("**추천 후보 내림차순**")
+        st.dataframe(scan_df, width="stretch", hide_index=True)
+        st.caption("score = 30분봉 수렴/역전점수 + 기술점수 + 뉴스점수 + 거래량점수 + 재무점수 + 옵션/수급점수 + 15분봉 터틀점수. 직전 거래일 상향 돌파는 최고 가중치입니다.")
+        st.markdown("**후보를 차트에서 열기**")
+        cols = st.columns(5)
+        for i, t in enumerate(scan_df["ticker"].tolist()[:int(max_result)]):
+            if cols[i % 5].button(t, key=f"open_scan_{t}"):
+                st.session_state.selected_ticker = t
+                st.rerun()
     else:
-        st.error("차트 데이터를 가져오지 못했습니다.")
+        st.info("‘후보 종목 분석 실행’을 누르면 결과가 표시됩니다.")
 
-with right:
-    st.subheader("에이전트 매수/매도 의견")
-    is_watch = ticker in [r[0] for r in rows]
-    cached = load_analysis(ticker)
-    if is_watch and not cached:
-        with st.spinner("관심종목이라 오늘 분석을 자동 실행합니다..."):
-            result = run_analysis(ticker, use_llm=use_llm)
-    elif cached:
-        result = json.loads(cached[3])
+
+with market_tab:
+    st.subheader("시장 상태 엔진")
+    st.caption("S&P500·NASDAQ·Russell2000의 추세를 먼저 확인합니다. 강세장에서는 돌파 신호 신뢰도가 높고, 약세장에서는 후보 점수를 보수적으로 해석합니다.")
+    if st.button("시장·섹터 업데이트", type="primary"):
+        st.session_state['market_df']=market_dashboard()
+        st.session_state['sector_df']=sector_dashboard()
+    mdf=st.session_state.get('market_df')
+    sdf=st.session_state.get('sector_df')
+    if isinstance(mdf, pd.DataFrame):
+        st.markdown("**시장 상태**")
+        st.dataframe(mdf, width="stretch", hide_index=True)
+    if isinstance(sdf, pd.DataFrame):
+        st.markdown("**섹터 강도 순위**")
+        st.dataframe(sdf, width="stretch", hide_index=True)
+    st.markdown("**시장 체제 엔진**")
+    regime = classify_market_regime()
+    c1,c2,c3,c4 = st.columns(4)
+    c1.metric("시장 체제", regime.get('시장체제'))
+    c2.metric("시장 가중치", regime.get('시장가중치'))
+    c3.metric("평균 시장점수", regime.get('평균시장점수'))
+    c4.metric("VIX", regime.get('VIX'))
+    st.caption(regime.get('운용가이드'))
+    if st.button("섹터 로테이션 분석", type="secondary"):
+        st.session_state['rotation_df'] = sector_rotation_dashboard()
+    rdf = st.session_state.get('rotation_df')
+    if isinstance(rdf, pd.DataFrame) and not rdf.empty:
+        st.markdown("**섹터 로테이션 순위 — 바이오·제약·로봇 포함**")
+        st.dataframe(rdf, width="stretch", hide_index=True)
+    if not isinstance(mdf, pd.DataFrame):
+        st.info("버튼을 누르면 시장과 섹터 강도를 계산합니다.")
+
+with backtest_tab:
+    st.subheader("간단 백테스트")
+    st.caption("최근 2년 일봉에서 EMA8의 MA55 상향 돌파 또는 HH20 돌파 후 10거래일 성과를 단순 검증합니다.")
+    bt_count=st.selectbox("검증 종목 수", [20,30,50], index=1)
+    if st.button("백테스트 실행", type="primary"):
+        universe=get_scan_universe()
+        # 거래량 상위 일부를 먼저 사용
+        daily=bulk_price_download(universe, period="3mo", interval="1d")
+        vols=[]
+        for t,dd in daily.items():
+            if dd is not None and not dd.empty and 'Volume' in dd.columns:
+                vols.append((t,_safe_float(dd['Volume'].iloc[-1],0)))
+        top=[t for t,_ in sorted(vols,key=lambda x:x[1], reverse=True)[:int(bt_count)]] or universe[:int(bt_count)]
+        with st.spinner("백테스트 계산 중..."):
+            st.session_state['bt_df']=enhanced_backtest(top, max_names=int(bt_count))
+    bdf=st.session_state.get('bt_df')
+    if isinstance(bdf, pd.DataFrame) and not bdf.empty:
+        st.dataframe(bdf, width="stretch", hide_index=True)
     else:
-        result = None
+        st.info("백테스트 실행 버튼을 누르면 결과가 표시됩니다.")
 
-    if st.button("🔎 지금 분석", type="primary"):
-        with st.spinner("뉴스와 차트를 종합 분석 중..."):
-            result = run_analysis(ticker, use_llm=use_llm, force=True)
 
-    if result:
-        op = result["opinion"]
-        st.metric("의견", op, f"score {result['score']:.1f}")
-        st.markdown("**분석 결과**")
-        for line in summary_lines(result, ticker):
-            st.write(f"• {line}")
-
-        st.markdown("**수집한 뉴스 헤드라인**")
-        news = result.get("news", {})
-        for section, title in [("seeking_alpha_signal", "Seeking Alpha"), ("us_economy_news", "미국 경제뉴스"), ("company_news", "기업뉴스")]:
-            st.markdown(f"_{title}_")
-            for item in news.get(section, [])[:6]:
-                headline = item.get("title", "")
-                link = item.get("link", "")
-                if link:
-                    st.markdown(f"- [{headline}]({link})")
-                else:
-                    st.write(f"- {headline}")
+with portfolio_tab:
+    st.subheader("V10 포트폴리오·위험관리")
+    st.caption("추천 종목을 그대로 매수하는 기능이 아니라, 계좌 규모와 1회 위험률 기준으로 참고 수량을 계산합니다.")
+    c1,c2,c3,c4=st.columns([1,1,1,1])
+    capital=c1.number_input("계좌 규모", min_value=1000.0, value=100000.0, step=1000.0)
+    risk_pct=c2.number_input("1종목 위험률%", min_value=0.1, max_value=5.0, value=1.0, step=0.1)
+    max_pos=c3.selectbox("최대 종목 수", [5,8,10,15], index=1)
+    src=c4.selectbox("포트폴리오 소스", ["후보 스캐너", "관심종목", "백테스트 상위"])
+    if st.button("포트폴리오 제안 생성", type="primary"):
+        if src=="후보 스캐너":
+            source_df=st.session_state.get('scan_df')
+        elif src=="백테스트 상위":
+            source_df=st.session_state.get('bt_df') if 'bt_df' in st.session_state else st.session_state.get('k_bt_df')
+        else:
+            source_df=watchlist_source_df()
+        if not isinstance(source_df, pd.DataFrame) or source_df.empty:
+            st.warning("먼저 후보 스캐너, 백테스트, 또는 관심종목 Daily 업데이트를 실행하세요.")
+        else:
+            plan_df=build_portfolio_plan(source_df, capital, int(max_pos), float(risk_pct))
+            st.session_state['portfolio_plan_df']=plan_df
+            save_portfolio_plan(plan_df, capital, risk_pct)
+    pdf=st.session_state.get('portfolio_plan_df')
+    if isinstance(pdf, pd.DataFrame) and not pdf.empty:
+        st.dataframe(pdf, width="stretch", hide_index=True)
+        st.caption("권장수량은 손절가까지 갔을 때 계좌의 지정 위험률만 손실 보도록 계산한 참고값입니다.")
     else:
-        st.info("관심그룹이 아닌 종목은 ‘🔎 지금 분석’을 눌러야 분석됩니다.")
+        st.info("포트폴리오 제안 생성 버튼을 누르면 결과가 표시됩니다.")
+
+with journal_tab:
+    st.subheader("V10 매매일지")
+    st.caption("추천 → 실제 매수 → 결과를 기록해야 앱의 조건이 실제로 유효한지 알 수 있습니다.")
+    with st.form("journal_add"):
+        c1,c2,c3,c4,c5,c6=st.columns(6)
+        default_t = st.session_state.get('selected_ticker','TSLA')
+        jt=c1.text_input("티커", value=default_t).upper().strip()
+        side=c2.selectbox("방향", ["BUY", "SELL"])
+        entry=c3.number_input("진입가", min_value=0.0, value=0.0, step=0.01)
+        stop=c4.number_input("손절가", min_value=0.0, value=0.0, step=0.01)
+        target=c5.number_input("목표가", min_value=0.0, value=0.0, step=0.01)
+        qty=c6.number_input("수량", min_value=0.0, value=0.0, step=1.0)
+        note=st.text_input("메모", value="")
+        submitted=st.form_submit_button("매매 기록 추가")
+        if submitted and jt and entry>0 and qty>0:
+            add_trade_journal(jt, side, entry, stop, target, qty, note)
+            st.success("매매일지에 기록했습니다.")
+    jdf=journal_df()
+    if not jdf.empty:
+        st.dataframe(jdf, width="stretch", hide_index=True)
+        open_ids=jdf[jdf['상태']=='OPEN']['id'].tolist()
+        if open_ids:
+            c1,c2=st.columns([1,1])
+            close_id=c1.selectbox("청산할 기록", open_ids)
+            exit_price=c2.number_input("청산가", min_value=0.0, value=0.0, step=0.01)
+            if st.button("선택 기록 청산") and exit_price>0:
+                close_trade_journal(int(close_id), float(exit_price))
+                st.rerun()
+        closed=jdf[jdf['상태']=='CLOSED']
+        if not closed.empty:
+            win=(closed['손익%']>0).mean()*100
+            total=closed['손익금'].sum()
+            st.metric("기록된 매매 승률", f"{win:.1f}%", f"총손익 {total:,.0f}")
+    else:
+        st.info("아직 기록된 매매가 없습니다.")
+
+
+with learning_tab:
+    st.subheader("V11 성과학습·추천 검증")
+    st.caption("추천된 종목을 자동 저장하고, 지정 기간이 지난 뒤 수익률을 확인해 전략이 실제로 맞는지 검증합니다.")
+    c1,c2,c3 = st.columns([1,1,2])
+    if c1.button("30일 지난 추천 검증", type="primary"):
+        n=verify_recommendations(force=False)
+        st.success(f"검증 완료: {n}건 업데이트")
+    if c2.button("전체 강제 재검증"):
+        n=verify_recommendations(force=True)
+        st.success(f"검증 완료: {n}건 업데이트")
+    if c3.button("현재 후보를 추천 기록에 저장"):
+        save_recommendations_from_df(st.session_state.get('scan_df'), source='scanner_manual', horizon_days=30)
+        st.success("현재 후보를 추천 기록에 저장했습니다.")
+
+    perf = recommendation_performance_df()
+    if isinstance(perf, pd.DataFrame) and not perf.empty:
+        st.markdown("**추천 성과 대시보드**")
+        st.dataframe(perf, width="stretch", hide_index=True)
+    else:
+        st.info("아직 검증 완료된 추천 기록이 없습니다.")
+
+    log = recommendation_log_df()
+    if isinstance(log, pd.DataFrame) and not log.empty:
+        st.markdown("**추천 기록**")
+        st.dataframe(log, width="stretch", hide_index=True)
+
+    st.markdown("**AI 투자일지 요약**")
+    for line in ai_investment_journal_text():
+        st.write(f"• {line}")
+
+
+with v12_tab:
+    st.subheader("V12 자동학습·옵션흐름·최적화·알림")
+    st.caption("추천 성과를 이용해 점수 가중치를 보수적으로 자동 조정하고, 옵션 흐름·시장체제·알림을 함께 확인합니다.")
+    c1,c2,c3 = st.columns(3)
+    if c1.button("AI 가중치 자동 조정", type="primary"):
+        st.session_state['v12_weights'] = update_adaptive_weights()
+    if c2.button("현재 후보 V12 재점수화"):
+        st.session_state['v12_rescore'] = apply_adaptive_weights(st.session_state.get('scan_df'))
+    if c3.button("관심종목 알림 스캔"):
+        st.session_state['v12_alerts'] = detect_alerts_v12([r[0] for r in watchlist_rows()])
+
+    st.markdown("**자동학습 가중치**")
+    st.json(st.session_state.get('v12_weights', get_adaptive_weights()))
+
+    rdf = st.session_state.get('v12_rescore')
+    if isinstance(rdf, pd.DataFrame) and not rdf.empty:
+        st.markdown("**V12 재점수화 후보**")
+        st.dataframe(rdf, width="stretch", hide_index=True)
+
+    st.markdown("**옵션 흐름 참고**")
+    opt_ticker = st.text_input("옵션 흐름 확인 티커", value=st.session_state.get('selected_ticker','TSLA')).upper().strip()
+    if st.button("옵션 콜/풋 흐름 확인"):
+        st.json(option_flow_score(opt_ticker))
+
+    st.markdown("**V12 최적화 포트폴리오**")
+    c1,c2,c3=st.columns(3)
+    v12_cap=c1.number_input("V12 계좌 규모", min_value=1000.0, value=100000.0, step=1000.0)
+    v12_pos=c2.selectbox("V12 최대 종목 수", [5,8,10,15], index=1)
+    v12_risk=c3.number_input("V12 1종목 위험률%", min_value=0.1, max_value=5.0, value=1.0, step=0.1)
+    if st.button("V12 포트폴리오 최적화"):
+        source = st.session_state.get('v12_rescore') if isinstance(st.session_state.get('v12_rescore'), pd.DataFrame) else st.session_state.get('scan_df')
+        st.session_state['v12_portfolio'] = optimize_portfolio_v12(source, float(v12_cap), int(v12_pos), float(v12_risk))
+    v12p=st.session_state.get('v12_portfolio')
+    if isinstance(v12p, pd.DataFrame) and not v12p.empty:
+        st.dataframe(v12p, width="stretch", hide_index=True)
+
+    alerts=st.session_state.get('v12_alerts')
+    if isinstance(alerts, pd.DataFrame) and not alerts.empty:
+        st.markdown("**이번 스캔 알림**")
+        st.dataframe(alerts, width="stretch", hide_index=True)
+    hist=alert_log_df()
+    if isinstance(hist, pd.DataFrame) and not hist.empty:
+        st.markdown("**최근 알림 기록**")
+        st.dataframe(hist, width="stretch", hide_index=True)
