@@ -16,6 +16,20 @@ except Exception:
     krx_stock = None
 
 load_dotenv()
+
+# 주요 한국 종목명 fallback: pykrx/yfinance가 실패해도 표에 최소한 회사명이 보이도록 합니다.
+KR_NAME_FALLBACK = {
+    "005930":"삼성전자", "000660":"SK하이닉스", "035420":"NAVER", "035720":"카카오",
+    "005380":"현대차", "000270":"기아", "005490":"POSCO홀딩스", "051910":"LG화학",
+    "373220":"LG에너지솔루션", "068270":"셀트리온", "207940":"삼성바이오로직스",
+    "086520":"에코프로", "247540":"에코프로비엠", "066570":"LG전자", "096770":"SK이노베이션",
+    "010130":"고려아연", "000250":"삼천당제약", "222800":"심텍", "034020":"두산에너빌리티",
+    "065350":"신성델타테크", "357780":"솔브레인", "253450":"스튜디오드래곤", "121600":"나노신소재",
+    "032830":"삼성생명", "005440":"현대지에프홀딩스", "028260":"삼성물산", "012330":"현대모비스",
+    "003670":"포스코퓨처엠", "042700":"한미반도체", "196170":"알테오젠", "028300":"HLB",
+    "277810":"레인보우로보틱스", "454910":"두산로보틱스", "090360":"로보스타", "058610":"에스피지"
+}
+
 DB_PATH = "kstock_agent.db"
 CACHE_DIR = "cache"
 os.makedirs(CACHE_DIR, exist_ok=True)
@@ -199,17 +213,20 @@ def kr_code_from_yf(ticker: str) -> str:
     return base.split(".")[0]
 
 def get_kr_name(ticker: str) -> str:
-    code = kr_code_from_yf(ticker)
+    code = kr_code_from_yf(ticker).zfill(6)
     if krx_stock is not None and code.isdigit():
         try:
             name = krx_stock.get_market_ticker_name(code)
-            if name:
-                return name
+            if name and str(name).strip():
+                return str(name).strip()
         except Exception:
             pass
+    if code in KR_NAME_FALLBACK:
+        return KR_NAME_FALLBACK[code]
     try:
         info = yf.Ticker(ticker).info
-        return info.get("longName") or info.get("shortName") or ticker
+        name = info.get("longName") or info.get("shortName")
+        return name if name else ticker
     except Exception:
         return ticker
 
@@ -1082,7 +1099,7 @@ def enhanced_backtest(tickers: List[str], max_names:int=30) -> pd.DataFrame:
                 profit_factor=(sum(wins)/abs(sum(losses))) if losses and abs(sum(losses))>0 else np.nan
                 mdd=max_drawdown(trades)
                 expectancy=np.mean(trades)*100
-                rows.append({"티커":t,"거래수":len(trades),"승률%":round(win_rate,1),"평균수익%":round(avg,2),"기대값%":round(expectancy,2),"Profit Factor":round(float(profit_factor),2) if not np.isnan(profit_factor) else None,"MDD%":mdd,"검증점수":round(win_rate/10+expectancy+(0 if np.isnan(profit_factor) else min(profit_factor,3)),2)})
+                rows.append({"티커":t,"종목명":get_kr_name(t),"거래수":len(trades),"승률%":round(win_rate,1),"평균수익%":round(avg,2),"기대값%":round(expectancy,2),"Profit Factor":round(float(profit_factor),2) if not np.isnan(profit_factor) else None,"MDD%":mdd,"검증점수":round(win_rate/10+expectancy+(0 if np.isnan(profit_factor) else min(profit_factor,3)),2)})
         except Exception:
             continue
     return pd.DataFrame(rows).sort_values('검증점수', ascending=False) if rows else pd.DataFrame()
@@ -1149,6 +1166,7 @@ def journal_df() -> pd.DataFrame:
     cols=['id','티커','방향','진입가','손절가','목표가','수량','상태','청산가','메모','진입일','청산일']
     df=pd.DataFrame(rows, columns=cols)
     if not df.empty:
+        df.insert(2, '종목명', df['티커'].map(get_kr_name))
         df['손익%']=df.apply(lambda r: round(((r['청산가'] if pd.notna(r['청산가']) else r['진입가'])/r['진입가']-1)*100,2) if r['진입가'] else 0, axis=1)
         df['손익금']=df.apply(lambda r: round((((r['청산가'] if pd.notna(r['청산가']) else r['진입가'])-r['진입가'])*r['수량']),2) if r['진입가'] else 0, axis=1)
     return df
@@ -1252,7 +1270,7 @@ def recommendation_log_df() -> pd.DataFrame:
     cols=['id','종목','소스','추천점수','추천가','추천일','검증일수','확인일','현재가','수익률%','상태','메모']
     df=pd.DataFrame(rows, columns=cols)
     if not df.empty:
-        df['종목명']=df['종목'].map(lambda x: get_kr_name(x))
+        df.insert(2, '종목명', df['종목'].map(lambda x: get_kr_name(x)))
     return df
 
 
@@ -1498,15 +1516,18 @@ def detect_alerts_v12(tickers: List[str]) -> pd.DataFrame:
             if tm.get('hh_breakout') or ts>=3:
                 msg = 'HH20 돌파' if tm.get('hh_breakout') else '기술점수 강세'
                 score=float(tm.get('score',0))+float(ts)
-                alerts.append({'ticker':t,'alert':msg,'score':round(score,2),'time':_now_text()})
+                alerts.append({'티커':t,'종목명':get_kr_name(t),'알림':msg,'점수':round(score,2),'시간':_now_text()})
                 db_execute("INSERT INTO alert_log(ticker,alert_type,message,score,created_at) VALUES(?,?,?,?,?)", (t,msg,msg,score,_now_text()))
         except Exception:
             continue
-    return pd.DataFrame(alerts).sort_values('score',ascending=False) if alerts else pd.DataFrame()
+    return pd.DataFrame(alerts).sort_values('점수',ascending=False) if alerts else pd.DataFrame()
 
 def alert_log_df() -> pd.DataFrame:
     rows=db_execute("SELECT ticker,alert_type,message,score,created_at FROM alert_log ORDER BY id DESC LIMIT 200", fetch=True)
-    return pd.DataFrame(rows, columns=['ticker','alert','message','score','created_at']) if rows else pd.DataFrame()
+    df = pd.DataFrame(rows, columns=['티커','알림유형','메시지','점수','시간']) if rows else pd.DataFrame()
+    if not df.empty:
+        df.insert(1, '종목명', df['티커'].map(get_kr_name))
+    return df
 
 st.title("📈 Korea Stock Agent Pro V7 — AI 자동학습 투자 OS")
 st.caption("관심그룹은 매일 1회 자동 캐시 분석, 비관심 종목은 분석 버튼 클릭 시에만 분석됩니다. 국내 증권/경제/기업 뉴스는 RSS 검색 헤드라인 기반으로 참고하며, 거래량·외국인/기관 수급·재무/실적·터틀 점수를 함께 반영합니다.")
