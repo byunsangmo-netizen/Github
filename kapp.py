@@ -1123,7 +1123,7 @@ def build_portfolio_plan(source_df: pd.DataFrame, capital: float, max_positions:
             ps=position_size_from_plan(capital, risk_pct, entry, stop)
             s=float(r[score_col]) if score_col and pd.notna(r[score_col]) else 1.0
             score_weight=round(max(s,0)/total_score*100,2)
-            rows.append({"티커":t,"점수":round(s,2),"점수비중%":score_weight,"참고진입가":entry,"손절가":stop,"목표가":target,"권장수량":ps['quantity'],"포지션금액":ps['position_value'],"계좌비중%":ps['weight_pct'],"1회위험금액":ps['risk_amount']})
+            rows.append({"티커":t,"종목명":get_kr_name(t),"점수":round(s,2),"점수비중%":score_weight,"참고진입가":entry,"손절가":stop,"목표가":target,"권장수량":ps['quantity'],"포지션금액":ps['position_value'],"계좌비중%":ps['weight_pct'],"1회위험금액":ps['risk_amount']})
         except Exception:
             continue
     return pd.DataFrame(rows)
@@ -1484,7 +1484,7 @@ def optimize_portfolio_v12(source_df: pd.DataFrame, capital: float, max_position
             px=np.nan
         alloc=float(invest_capital*weights.loc[idx])
         qty=int(alloc/px) if px and not pd.isna(px) and px>0 else 0
-        rows.append({'ticker':t,'v12_score':float(s.loc[idx]),'비중%':round(float(weights.loc[idx])*100,2),'배정금액':round(alloc,2),'현재가':round(float(px),2) if px==px else None,'권장수량':qty,'시장체제':regime.get('시장체제')})
+        rows.append({'티커':t,'종목명':get_kr_name(t),'v12_score':float(s.loc[idx]),'비중%':round(float(weights.loc[idx])*100,2),'배정금액':round(alloc,2),'현재가':round(float(px),2) if px==px else None,'권장수량':qty,'시장체제':regime.get('시장체제')})
     return pd.DataFrame(rows)
 
 def detect_alerts_v12(tickers: List[str]) -> pd.DataFrame:
