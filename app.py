@@ -699,10 +699,7 @@ def scan_ema_reversal_candidates(use_news=True, max_candidates=20) -> pd.DataFra
         total_score = metrics["base_score"] + tech_score + news_score + turtle_score + vol_score + fund_score + opt_score
         rows.append({
             "ticker": t,
-<<<<<<< Updated upstream
-=======
             "종목명": get_us_name(t),
->>>>>>> Stashed changes
             "score": round(total_score, 2),
             "수렴/역전점수": round(metrics["base_score"], 2),
             "터틀점수": round(turtle_score, 2),
@@ -963,11 +960,7 @@ def simple_backtest(tickers: List[str], max_names:int=30) -> pd.DataFrame:
             if trades:
                 win=sum(1 for x in trades if x>0)/len(trades)*100
                 avg=np.mean(trades)*100
-<<<<<<< Updated upstream
-                rows.append({"티커":t,"거래수":len(trades),"승률%":round(win,1),"평균수익%":round(avg,2),"총점":round(win/10+avg,2)})
-=======
                 rows.append({"티커":t,"종목명":get_us_name(t),"거래수":len(trades),"승률%":round(win,1),"평균수익%":round(avg,2),"총점":round(win/10+avg,2)})
->>>>>>> Stashed changes
         except Exception:
             continue
     return pd.DataFrame(rows).sort_values('총점', ascending=False) if rows else pd.DataFrame()
@@ -1090,11 +1083,7 @@ def enhanced_backtest(tickers: List[str], max_names:int=30) -> pd.DataFrame:
                 profit_factor=(sum(wins)/abs(sum(losses))) if losses and abs(sum(losses))>0 else np.nan
                 mdd=max_drawdown(trades)
                 expectancy=np.mean(trades)*100
-<<<<<<< Updated upstream
-                rows.append({"티커":t,"거래수":len(trades),"승률%":round(win_rate,1),"평균수익%":round(avg,2),"기대값%":round(expectancy,2),"Profit Factor":round(float(profit_factor),2) if not np.isnan(profit_factor) else None,"MDD%":mdd,"검증점수":round(win_rate/10+expectancy+(0 if np.isnan(profit_factor) else min(profit_factor,3)),2)})
-=======
                 rows.append({"티커":t,"종목명":get_us_name(t),"거래수":len(trades),"승률%":round(win_rate,1),"평균수익%":round(avg,2),"기대값%":round(expectancy,2),"Profit Factor":round(float(profit_factor),2) if not np.isnan(profit_factor) else None,"MDD%":mdd,"검증점수":round(win_rate/10+expectancy+(0 if np.isnan(profit_factor) else min(profit_factor,3)),2)})
->>>>>>> Stashed changes
         except Exception:
             continue
     return pd.DataFrame(rows).sort_values('검증점수', ascending=False) if rows else pd.DataFrame()
@@ -1135,11 +1124,7 @@ def build_portfolio_plan(source_df: pd.DataFrame, capital: float, max_positions:
             ps=position_size_from_plan(capital, risk_pct, entry, stop)
             s=float(r[score_col]) if score_col and pd.notna(r[score_col]) else 1.0
             score_weight=round(max(s,0)/total_score*100,2)
-<<<<<<< Updated upstream
-            rows.append({"티커":t,"점수":round(s,2),"점수비중%":score_weight,"참고진입가":entry,"손절가":stop,"목표가":target,"권장수량":ps['quantity'],"포지션금액":ps['position_value'],"계좌비중%":ps['weight_pct'],"1회위험금액":ps['risk_amount']})
-=======
             rows.append({"티커":t,"종목명":get_us_name(t),"점수":round(s,2),"점수비중%":score_weight,"참고진입가":entry,"손절가":stop,"목표가":target,"권장수량":ps['quantity'],"포지션금액":ps['position_value'],"계좌비중%":ps['weight_pct'],"1회위험금액":ps['risk_amount']})
->>>>>>> Stashed changes
         except Exception:
             continue
     return pd.DataFrame(rows)
@@ -1165,10 +1150,7 @@ def journal_df() -> pd.DataFrame:
     cols=['id','티커','방향','진입가','손절가','목표가','수량','상태','청산가','메모','진입일','청산일']
     df=pd.DataFrame(rows, columns=cols)
     if not df.empty:
-<<<<<<< Updated upstream
-=======
         df.insert(2, '종목명', df['티커'].map(get_us_name))
->>>>>>> Stashed changes
         df['손익%']=df.apply(lambda r: round(((r['청산가'] if pd.notna(r['청산가']) else r['진입가'])/r['진입가']-1)*100,2) if r['진입가'] else 0, axis=1)
         df['손익금']=df.apply(lambda r: round((((r['청산가'] if pd.notna(r['청산가']) else r['진입가'])-r['진입가'])*r['수량']),2) if r['진입가'] else 0, axis=1)
     return df
@@ -1272,14 +1254,10 @@ def save_recommendations_from_df(df: pd.DataFrame, source: str='scanner', horizo
 def recommendation_log_df() -> pd.DataFrame:
     rows=db_execute("SELECT id,ticker,source,score,entry,recommended_at,horizon_days,checked_at,current_price,return_pct,status,note FROM recommendation_log ORDER BY id DESC", fetch=True)
     cols=['id','티커','소스','추천점수','추천가','추천일','검증일수','확인일','현재가','수익률%','상태','메모']
-<<<<<<< Updated upstream
-    return pd.DataFrame(rows, columns=cols)
-=======
     df=pd.DataFrame(rows, columns=cols)
     if not df.empty:
         df.insert(2, '종목명', df['티커'].map(get_us_name))
     return df
->>>>>>> Stashed changes
 
 
 def verify_recommendations(force: bool=False) -> int:
@@ -1518,11 +1496,7 @@ def optimize_portfolio_v12(source_df: pd.DataFrame, capital: float, max_position
             px=np.nan
         alloc=float(invest_capital*weights.loc[idx])
         qty=int(alloc/px) if px and not pd.isna(px) and px>0 else 0
-<<<<<<< Updated upstream
-        rows.append({'ticker':t,'v12_score':float(s.loc[idx]),'비중%':round(float(weights.loc[idx])*100,2),'배정금액':round(alloc,2),'현재가':round(float(px),2) if px==px else None,'권장수량':qty,'시장체제':regime.get('시장체제')})
-=======
         rows.append({'티커':t,'종목명':get_us_name(t),'v12_score':float(s.loc[idx]),'비중%':round(float(weights.loc[idx])*100,2),'배정금액':round(alloc,2),'현재가':round(float(px),2) if px==px else None,'권장수량':qty,'시장체제':regime.get('시장체제')})
->>>>>>> Stashed changes
     return pd.DataFrame(rows)
 
 def detect_alerts_v12(tickers: List[str]) -> pd.DataFrame:
@@ -1536,17 +1510,6 @@ def detect_alerts_v12(tickers: List[str]) -> pd.DataFrame:
             if tm.get('hh_breakout') or ts>=3:
                 msg = 'HH20 돌파' if tm.get('hh_breakout') else '기술점수 강세'
                 score=float(tm.get('score',0))+float(ts)
-<<<<<<< Updated upstream
-                alerts.append({'ticker':t,'alert':msg,'score':round(score,2),'time':_now_text()})
-                db_execute("INSERT INTO alert_log(ticker,alert_type,message,score,created_at) VALUES(?,?,?,?,?)", (t,msg,msg,score,_now_text()))
-        except Exception:
-            continue
-    return pd.DataFrame(alerts).sort_values('score',ascending=False) if alerts else pd.DataFrame()
-
-def alert_log_df() -> pd.DataFrame:
-    rows=db_execute("SELECT ticker,alert_type,message,score,created_at FROM alert_log ORDER BY id DESC LIMIT 200", fetch=True)
-    return pd.DataFrame(rows, columns=['ticker','alert','message','score','created_at']) if rows else pd.DataFrame()
-=======
                 alerts.append({'티커':t,'종목명':get_us_name(t),'알림':msg,'점수':round(score,2),'시간':_now_text()})
                 db_execute("INSERT INTO alert_log(ticker,alert_type,message,score,created_at) VALUES(?,?,?,?,?)", (t,msg,msg,score,_now_text()))
         except Exception:
@@ -1559,7 +1522,6 @@ def alert_log_df() -> pd.DataFrame:
     if not df.empty:
         df.insert(1, '종목명', df['티커'].map(get_us_name))
     return df
->>>>>>> Stashed changes
 
 st.title("📈 Stock Agent Pro V12 — AI 자동학습 투자 OS")
 st.caption("관심그룹은 매일 1회 자동 캐시 분석, 비관심 종목은 분석 버튼 클릭 시에만 분석됩니다. Seeking Alpha는 RSS/검색 헤드라인 기반으로 참고합니다.")
