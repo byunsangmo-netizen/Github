@@ -1,14 +1,231 @@
 from __future__ import annotations
-import os, json, sqlite3, datetime as dt, time
+import os, json, sqlite3, datetime as dt, time, hashlib
 from typing import List, Dict
 
 import numpy as np
 import pandas as pd
 import streamlit as st
+import yfinance as yf
+import plotly.graph_objects as go
 
-from core.indicators import enrich, add_hhll, latest_technical_score, sell_signal
-from data.us_market import fetch_price, get_us_name, UNIVERSE, SECTOR_ETFS
-from ui.charts import price_chart, rsi_chart, hhll_chart
+
+
+# ----------------------------- Self-contained V13 modules -----------------------------
+CACHE_DIR = "cache_prices"
+os.makedirs(CACHE_DIR, exist_ok=True)
+
+NAME_FALLBACK = {
+    "AAPL":"Apple", "MSFT":"Microsoft", "NVDA":"NVIDIA", "AMZN":"Amazon", "GOOGL":"Alphabet Class A",
+    "GOOG":"Alphabet Class C", "META":"Meta Platforms", "TSLA":"Tesla", "AVGO":"Broadcom", "AMD":"Advanced Micro Devices",
+    "MU":"Micron Technology", "NFLX":"Netflix", "ORCL":"Oracle", "ARM":"Arm Holdings", "INTC":"Intel",
+    "SMH":"VanEck Semiconductor ETF", "XLK":"Technology Select Sector SPDR", "XBI":"SPDR S&P Biotech ETF",
+    "BOTZ":"Global X Robotics & AI ETF", "ROBO":"ROBO Global Robotics & Automation ETF"
+}
+
+UNIVERSE = [
+    "AAPL","MSFT","NVDA","AMZN","GOOGL","GOOG","META","TSLA","AVGO","AMD","NFLX","ORCL","COST","PLTR","ADBE",
+    "CRM","CSCO","INTC","MU","QCOM","AMAT","LRCX","KLAC","TXN","ARM","SMCI","PANW","CRWD","NOW","SHOP",
+    "UBER","ABNB","MELI","PYPL","SBUX","PEP","COST","TMUS","CMCSA","INTU","ADP","ISRG","VRTX","REGN",
+    "LLY","NVO","MRNA","PFE","JNJ","UNH","TMO","DHR","ABT","ABBV","GILD","AMGN","BIIB","ROKU","SNOW",
+    "DDOG","NET","MDB","ZS","DELL","HPQ","WMT","HD","LOW","JPM","BAC","GS","MS","V","MA","AXP","XOM","CVX",
+    "COP","SLB","GE","CAT","DE","HON","RTX","LMT","NOC","ROK","SYM","TER","IRBT"
+]
+
+SECTOR_ETFS = {
+    "S&P500":"SPY", "NASDAQ":"QQQ", "반도체":"SMH", "기술":"XLK", "AI·소프트웨어":"IGV",
+    "바이오·제약·의료":"XBI", "헬스케어":"XLV", "로봇":"BOTZ", "금융":"XLF", "에너지":"XLE",
+    "산업재":"XLI", "소비재":"XLY", "필수소비":"XLP"
+}
+
+def rsi(series: pd.Series, period: int = 14) -> pd.Series:
+    delta = series.diff()
+    gain = delta.clip(lower=0).rolling(period).mean()
+    loss = (-delta.clip(upper=0)).rolling(period).mean()
+    rs = gain / loss.replace(0, np.nan)
+    return 100 - (100 / (1 + rs))
+
+def enrich(df: pd.DataFrame) -> pd.DataFrame:
+    if df is None or df.empty:
+        return pd.DataFrame()
+    df = df.copy()
+    for c in ["Open", "High", "Low", "Close", "Volume"]:
+        if c in df.columns:
+            df[c] = pd.to_numeric(df[c], errors="coerce")
+    df = df.dropna(subset=["Close"])
+    df["EMA8"] = df["Close"].ewm(span=8, adjust=False).mean()
+    df["EMA13"] = df["Close"].ewm(span=13, adjust=False).mean()
+    df["MA21"] = df["Close"].rolling(21).mean()
+    df["MA55"] = df["Close"].rolling(55).mean()
+    df["RSI14"] = rsi(df["Close"], 14)
+    if "Volume" in df.columns:
+        df["VOL_MA20"] = df["Volume"].rolling(20).mean()
+        df["VOL_RATIO"] = df["Volume"] / df["VOL_MA20"].replace(0, np.nan)
+        direction = np.sign(df["Close"].diff()).fillna(0)
+        df["OBV"] = (direction * df["Volume"].fillna(0)).cumsum()
+        df["OBV_MA10"] = df["OBV"].rolling(10).mean()
+    return df
+
+def add_hhll(df: pd.DataFrame, hh: int = 20, ll: int = 10) -> pd.DataFrame:
+    if df is None or df.empty:
+        return pd.DataFrame()
+    out = df.copy()
+    out["HH20"] = out["High"].rolling(hh).max().shift(1)
+    out["LL10"] = out["Low"].rolling(ll).min().shift(1)
+    out["HH20_BREAK"] = out["Close"] > out["HH20"]
+    out["LL10_BREAK"] = out["Close"] < out["LL10"]
+    return out
+
+def latest_technical_score(df: pd.DataFrame) -> tuple[float, list[str]]:
+    if df is None or df.empty or len(df.dropna()) < 60:
+        return 0.0, ["가격 데이터가 부족합니다."]
+    d = enrich(df).dropna()
+    if d.empty:
+        return 0.0, ["지표 계산 데이터가 부족합니다."]
+    last = d.iloc[-1]
+    score = 0.0; reasons=[]
+    if last["Close"] > last["MA21"]: score += 1.0; reasons.append("종가가 MA21 위")
+    else: score -= 0.7; reasons.append("종가가 MA21 아래")
+    if last["EMA8"] > last["EMA13"]: score += 0.8; reasons.append("EMA8이 EMA13 위")
+    else: score -= 0.5; reasons.append("EMA8이 EMA13 아래")
+    if last["MA21"] > last["MA55"]: score += 1.0; reasons.append("MA21이 MA55 위")
+    else: score -= 0.7; reasons.append("MA21이 MA55 아래")
+    if 45 <= float(last.get("RSI14", 50)) <= 68:
+        score += 0.7; reasons.append(f"RSI {last['RSI14']:.1f}: 양호")
+    elif float(last.get("RSI14", 50)) > 75:
+        score -= 0.3; reasons.append(f"RSI {last['RSI14']:.1f}: 단기 과열")
+    elif float(last.get("RSI14", 50)) < 40:
+        score -= 0.5; reasons.append(f"RSI {last['RSI14']:.1f}: 약세")
+    if "VOL_RATIO" in d.columns and pd.notna(last.get("VOL_RATIO")):
+        vr = float(last["VOL_RATIO"])
+        if vr >= 1.8: score += 0.8; reasons.append(f"거래량 {vr:.1f}배")
+        elif vr >= 1.2: score += 0.3; reasons.append(f"거래량 {vr:.1f}배")
+    return round(score, 2), reasons
+
+def sell_signal(df_daily: pd.DataFrame, df_hhll: pd.DataFrame | None = None, buy_price: float | None = None) -> dict:
+    if df_daily is None or df_daily.empty or len(df_daily.dropna()) < 60:
+        return {"의견": "관찰", "점수": 0.0, "근거": "일봉 데이터가 부족합니다.", "손절참고": None, "목표참고": None}
+    d = enrich(df_daily).dropna(); h = add_hhll(df_hhll if df_hhll is not None and not df_hhll.empty else df_daily).dropna()
+    last = d.iloc[-1]; price = float(last["Close"]); score = 0.0; reasons=[]
+    if price < float(last["MA55"]): score -= 2.0; reasons.append("종가가 MA55 아래로 하락")
+    if float(last["EMA8"]) < float(last["EMA13"]): score -= 1.0; reasons.append("EMA8이 EMA13 아래로 약화")
+    if float(last.get("RSI14", 50)) < 42: score -= 0.8; reasons.append(f"RSI {last['RSI14']:.1f}: 약세")
+    if float(last.get("RSI14", 50)) > 75: score -= 0.4; reasons.append(f"RSI {last['RSI14']:.1f}: 과열 후 조정 주의")
+    if not h.empty:
+        hh = h.iloc[-1]
+        if bool(hh.get("LL10_BREAK", False)): score -= 2.0; reasons.append("LL10 이탈: 터틀 기준 위험 신호")
+        if bool(hh.get("HH20_BREAK", False)): score += 1.2; reasons.append("HH20 돌파: 추세 유지 신호")
+    if price > float(last["EMA8"]) and float(last["EMA8"]) > float(last["EMA13"]):
+        score += 1.0; reasons.append("가격이 EMA8 위이고 단기 추세 양호")
+    if buy_price and buy_price > 0:
+        pnl = (price / float(buy_price) - 1) * 100
+        if pnl >= 20: score -= 0.4; reasons.append(f"수익률 {pnl:.1f}%: 일부 이익실현 검토")
+        elif pnl <= -7: score -= 1.0; reasons.append(f"수익률 {pnl:.1f}%: 손실 관리 필요")
+    if score <= -2.5: opinion = "매도 검토"
+    elif score <= -0.8: opinion = "부분매도/비중축소"
+    else: opinion = "유지"
+    stop_ref = round(float(h["LL10"].iloc[-1]), 2) if not h.empty and pd.notna(h["LL10"].iloc[-1]) else round(price*0.94, 2)
+    target_ref = round(price + (price - stop_ref) * 2, 2) if stop_ref < price else None
+    return {"의견": opinion, "점수": round(score, 2), "현재가": round(price, 2), "손절참고": stop_ref, "목표참고": target_ref, "근거": " / ".join(reasons[:6])}
+
+def _cache_path(ticker: str, period: str, interval: str) -> str:
+    key = hashlib.md5(f"{ticker}_{period}_{interval}".encode()).hexdigest()
+    return os.path.join(CACHE_DIR, f"{key}.csv")
+
+def _read_cache(path: str, ttl_hours: int) -> pd.DataFrame:
+    try:
+        if os.path.exists(path) and (time.time() - os.path.getmtime(path)) < ttl_hours * 3600:
+            df = pd.read_csv(path, index_col=0, parse_dates=True)
+            return enrich(df)
+    except Exception:
+        pass
+    return pd.DataFrame()
+
+def fetch_price(ticker: str, period: str="6mo", interval: str="1d", ttl_hours: int=12, force: bool=False, quiet: bool=True) -> pd.DataFrame:
+    ticker = str(ticker).upper().strip()
+    path = _cache_path(ticker, period, interval)
+    if not force:
+        cached = _read_cache(path, ttl_hours)
+        if not cached.empty:
+            return cached
+    try:
+        time.sleep(0.25)
+        df = yf.download(ticker, period=period, interval=interval, auto_adjust=False, progress=False, threads=False)
+        if df is None or df.empty:
+            return _read_cache(path, ttl_hours=24*30)
+        if isinstance(df.columns, pd.MultiIndex):
+            df.columns = df.columns.get_level_values(0)
+        df = df.dropna()
+        if not df.empty:
+            df.to_csv(path)
+        return enrich(df)
+    except Exception as e:
+        if not quiet:
+            st.warning(f"{ticker} 데이터 요청 실패: {e}")
+        return _read_cache(path, ttl_hours=24*30)
+
+@st.cache_data(ttl=86400, show_spinner=False)
+def get_us_name(ticker: str) -> str:
+    t = str(ticker).upper().strip()
+    if t in NAME_FALLBACK: return NAME_FALLBACK[t]
+    try:
+        info2 = yf.Ticker(t).info
+        return info2.get("longName") or info2.get("shortName") or t
+    except Exception:
+        return t
+
+def _x_values(df: pd.DataFrame):
+    return list(range(len(df)))
+
+def _tick_text(df: pd.DataFrame, max_ticks: int = 8):
+    if df.empty: return [], []
+    step = max(len(df)//max_ticks, 1)
+    vals = list(range(0, len(df), step))
+    txt = [df.index[i].strftime("%m/%d %H:%M") if hasattr(df.index[i], "strftime") else str(df.index[i]) for i in vals]
+    return vals, txt
+
+def price_chart(df: pd.DataFrame, ticker: str, title_suffix: str=""):
+    fig = go.Figure()
+    if df is None or df.empty:
+        fig.update_layout(title=f"{ticker} 데이터 없음")
+        return fig
+    x = _x_values(df)
+    fig.add_trace(go.Candlestick(x=x, open=df["Open"], high=df["High"], low=df["Low"], close=df["Close"], name="Price"))
+    for col, name in [("EMA8","EMA8"),("EMA13","EMA13"),("MA21","MA21"),("MA55","MA55")]:
+        if col in df.columns:
+            fig.add_trace(go.Scatter(x=x, y=df[col], mode="lines", name=name))
+    tv, tt = _tick_text(df); fig.update_xaxes(tickmode="array", tickvals=tv, ticktext=tt)
+    fig.update_layout(title=f"{ticker} Chart {title_suffix}", height=520, xaxis_rangeslider_visible=False, margin=dict(l=20,r=20,t=50,b=20))
+    return fig
+
+def rsi_chart(df: pd.DataFrame, ticker: str):
+    fig = go.Figure()
+    if df is None or df.empty or "RSI14" not in df.columns: return fig
+    x = _x_values(df)
+    fig.add_trace(go.Scatter(x=x, y=df["RSI14"], mode="lines", name="RSI14"))
+    fig.add_hline(y=70, line_dash="dash"); fig.add_hline(y=30, line_dash="dash")
+    tv, tt = _tick_text(df); fig.update_xaxes(tickmode="array", tickvals=tv, ticktext=tt)
+    fig.update_layout(title=f"{ticker} RSI", height=280, margin=dict(l=20,r=20,t=50,b=20))
+    return fig
+
+def hhll_chart(df: pd.DataFrame, ticker: str):
+    d = add_hhll(df).dropna() if df is not None and not df.empty else pd.DataFrame()
+    fig = go.Figure()
+    if d.empty:
+        fig.update_layout(title=f"{ticker} HHLL 데이터 없음")
+        return fig
+    x = list(range(len(d)))
+    fig.add_trace(go.Candlestick(x=x, open=d["Open"], high=d["High"], low=d["Low"], close=d["Close"], name="15분봉"))
+    fig.add_trace(go.Scatter(x=x, y=d["HH20"], mode="lines", name="Highest High 20"))
+    fig.add_trace(go.Scatter(x=x, y=d["LL10"], mode="lines", name="Lowest Low 10"))
+    br = d[d["HH20_BREAK"]]
+    if not br.empty:
+        fig.add_trace(go.Scatter(x=[d.index.get_loc(i) for i in br.index], y=br["Close"], mode="markers", name="HH20 돌파", marker_symbol="triangle-up", marker_size=10))
+    lb = d[d["LL10_BREAK"]]
+    if not lb.empty:
+        fig.add_trace(go.Scatter(x=[d.index.get_loc(i) for i in lb.index], y=lb["Close"], mode="markers", name="LL10 이탈", marker_symbol="triangle-down", marker_size=10))
+    tv, tt = _tick_text(d); fig.update_xaxes(tickmode="array", tickvals=tv, ticktext=tt)
+    fig.update_layout(title=f"{ticker} HHLL 터틀트레이딩 참고 차트", height=430, xaxis_rangeslider_visible=False, margin=dict(l=20,r=20,t=50,b=20))
+    return fig
 
 DB_PATH = "stock_agent_v13.db"
 
