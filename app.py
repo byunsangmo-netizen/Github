@@ -127,6 +127,101 @@ def sell_signal(df_daily: pd.DataFrame, df_hhll: pd.DataFrame | None = None, buy
     target_ref = round(price + (price - stop_ref) * 2, 2) if stop_ref < price else None
     return {"의견": opinion, "점수": round(score, 2), "현재가": round(price, 2), "손절참고": stop_ref, "목표참고": target_ref, "근거": " / ".join(reasons[:6])}
 
+
+
+def atr(df: pd.DataFrame, period: int = 14) -> pd.Series:
+    if df is None or df.empty or not all(c in df.columns for c in ["High", "Low", "Close"]):
+        return pd.Series(dtype=float)
+    high_low = df["High"] - df["Low"]
+    high_close = (df["High"] - df["Close"].shift()).abs()
+    low_close = (df["Low"] - df["Close"].shift()).abs()
+    tr = pd.concat([high_low, high_close, low_close], axis=1).max(axis=1)
+    return tr.rolling(period).mean()
+
+def v14_position_decision(df_daily: pd.DataFrame, df_hhll: pd.DataFrame | None = None, buy_price: float | None = None, max_price: float | None = None) -> dict:
+    """100점 기반 5단계 보유/매도 판단 엔진."""
+    if df_daily is None or df_daily.empty or len(df_daily.dropna()) < 60:
+        return {"AI의견":"관찰", "등급":"C", "종합점수":50, "핵심근거":"데이터 부족", "체크리스트":[], "현재가":0, "ATR손절":None, "추적손절":None, "터틀손절":None}
+    d = enrich(df_daily).copy().dropna()
+    if d.empty:
+        return {"AI의견":"관찰", "등급":"C", "종합점수":50, "핵심근거":"지표 계산 데이터 부족", "체크리스트":[], "현재가":0, "ATR손절":None, "추적손절":None, "터틀손절":None}
+    h = add_hhll(df_hhll if df_hhll is not None and not df_hhll.empty else df_daily).dropna()
+    last = d.iloc[-1]
+    price = float(last["Close"])
+    score = 50.0
+    checks=[]
+    def add(label, cond, pts_true, pts_false=0):
+        nonlocal score, checks
+        if cond:
+            score += pts_true; checks.append(f"■ {label}")
+        else:
+            score += pts_false; checks.append(f"□ {label}")
+    add("가격이 EMA8 위", price > float(last["EMA8"]), 8, -8)
+    add("EMA8 > EMA13", float(last["EMA8"]) > float(last["EMA13"]), 8, -8)
+    add("EMA13 > MA21", float(last["EMA13"]) > float(last["MA21"]), 8, -6)
+    add("MA21 > MA55", float(last["MA21"]) > float(last["MA55"]), 10, -10)
+    rsi_val=float(last.get("RSI14",50))
+    add(f"RSI {rsi_val:.1f}: 과열/약세 아님", 45 <= rsi_val <= 70, 6, -5 if rsi_val < 40 or rsi_val > 78 else 0)
+    vr=float(last.get("VOL_RATIO",0)) if pd.notna(last.get("VOL_RATIO",np.nan)) else 0
+    add(f"거래량 {vr:.1f}배", vr >= 1.2, 5, -2)
+    if not h.empty:
+        hh = h.iloc[-1]
+        add("HH20 돌파/유지", bool(hh.get("HH20_BREAK", False)) or price >= float(hh.get("HH20", price))*0.98, 10, -2)
+        add("LL10 이탈 없음", not bool(hh.get("LL10_BREAK", False)), 8, -18)
+        turtle_stop = round(float(hh["LL10"]),2) if pd.notna(hh.get("LL10")) else None
+    else:
+        turtle_stop=None
+    if buy_price and buy_price > 0:
+        pnl=(price/float(buy_price)-1)*100
+        if pnl >= 30:
+            score -= 5; checks.append(f"■ 수익률 {pnl:.1f}%: 일부 이익실현 후보")
+        elif pnl <= -7:
+            score -= 12; checks.append(f"■ 수익률 {pnl:.1f}%: 손실 관리 필요")
+        else:
+            checks.append(f"■ 수익률 {pnl:.1f}%: 정상 범위")
+    d["ATR14"] = atr(d,14)
+    atr_val = float(d["ATR14"].iloc[-1]) if pd.notna(d["ATR14"].iloc[-1]) else price*0.03
+    atr_stop = round(price - atr_val*2, 2)
+    if max_price and max_price > 0:
+        trailing_stop = round(max_price * 0.92, 2)
+    else:
+        trailing_stop = round(d["Close"].tail(40).max() * 0.92, 2)
+    # Stop breach penalties
+    if turtle_stop and price < turtle_stop:
+        score -= 20
+    if price < trailing_stop:
+        score -= 10; checks.append("■ 추적손절선 이탈")
+    score=max(0,min(100,round(score,0)))
+    if score >= 85:
+        opinion="추가매수"; grade="AAA"
+    elif score >= 70:
+        opinion="유지"; grade="AA"
+    elif score >= 55:
+        opinion="비중축소"; grade="A"
+    elif score >= 40:
+        opinion="절반매도"; grade="B"
+    else:
+        opinion="전량매도 검토"; grade="C"
+    key_reason=" / ".join(checks[:7])
+    return {"AI의견":opinion,"등급":grade,"종합점수":score,"핵심근거":key_reason,"체크리스트":checks,"현재가":round(price,2),"ATR손절":atr_stop,"추적손절":trailing_stop,"터틀손절":turtle_stop}
+
+def v14_briefing_rows() -> pd.DataFrame:
+    h = holdings_df()
+    if h.empty:
+        return pd.DataFrame()
+    rows=[]
+    invested = h[h["실제투자"]==True]
+    for _, r in invested.iterrows():
+        t=r["티커"]
+        daily=fetch_price(t, period="6mo", interval="1d", ttl_hours=6)
+        intraday=fetch_price(t, period="1mo", interval="15m", ttl_hours=3)
+        dec=v14_position_decision(daily, intraday, float(r.get("매수가") or 0), None)
+        bp=float(r.get("매수가") or 0)
+        current=dec.get("현재가",0)
+        pnl=(current/bp-1)*100 if current and bp else 0
+        rows.append({"티커":t,"종목명":r.get("종목명") or get_us_name(t),"수익률%":round(pnl,2),"AI의견":dec["AI의견"],"등급":dec["등급"],"점수":dec["종합점수"],"현재가":dec["현재가"],"ATR손절":dec["ATR손절"],"추적손절":dec["추적손절"],"터틀손절":dec["터틀손절"],"핵심근거":dec["핵심근거"]})
+    return pd.DataFrame(rows)
+
 def _cache_path(ticker: str, period: str, interval: str) -> str:
     key = hashlib.md5(f"{ticker}_{period}_{interval}".encode()).hexdigest()
     return os.path.join(CACHE_DIR, f"{key}.csv")
@@ -227,9 +322,9 @@ def hhll_chart(df: pd.DataFrame, ticker: str):
     fig.update_layout(title=f"{ticker} HHLL 터틀트레이딩 참고 차트", height=430, xaxis_rangeslider_visible=False, margin=dict(l=20,r=20,t=50,b=20))
     return fig
 
-DB_PATH = "stock_agent_v13.db"
+DB_PATH = "stock_agent_v14.db"
 
-st.set_page_config(page_title="Stock Agent Pro V13", page_icon="📈", layout="wide")
+st.set_page_config(page_title="Kappy Investment OS V14", page_icon="📈", layout="wide")
 
 CSS = """
 <style>
@@ -422,17 +517,17 @@ def analyze_holdings_current(df_holdings: pd.DataFrame) -> pd.DataFrame:
         t=r["티커"]
         daily=fetch_price(t, period="6mo", interval="1d", ttl_hours=6)
         intraday=fetch_price(t, period="1mo", interval="15m", ttl_hours=3)
-        sig=sell_signal(daily, intraday, float(r.get("매수가") or 0))
-        current=sig.get("현재가") or 0
+        dec=v14_position_decision(daily, intraday, float(r.get("매수가") or 0), None)
+        current=dec.get("현재가") or 0
         buy_price=float(r.get("매수가") or 0)
         amount=float(r.get("매수금액") or 0)
         pnl=(current/buy_price-1)*100 if current and buy_price else 0
-        rows.append({"티커":t,"종목명":r.get("종목명") or get_us_name(t),"현재가":current,"매수가":buy_price,"매수금액":amount,"수익률%":round(pnl,2),"의견":sig["의견"],"매도점수":sig["점수"],"손절참고":sig["손절참고"],"목표참고":sig["목표참고"],"핵심근거":sig["근거"]})
+        rows.append({"티커":t,"종목명":r.get("종목명") or get_us_name(t),"현재가":current,"매수가":buy_price,"매수금액":amount,"수익률%":round(pnl,2),"AI의견":dec["AI의견"],"등급":dec["등급"],"점수":dec["종합점수"],"ATR손절":dec["ATR손절"],"추적손절":dec["추적손절"],"터틀손절":dec["터틀손절"],"핵심근거":dec["핵심근거"]})
     return pd.DataFrame(rows)
 
 # ----------------------------- Sidebar -----------------------------
 st.sidebar.header("설정")
-st.sidebar.caption("V13은 자동 대량 요청을 피하고, 버튼을 누를 때만 데이터를 수집합니다.")
+st.sidebar.caption("V14는 보유 종목 중심 UI와 5단계 매도 엔진을 추가했습니다. 데이터는 버튼을 눌렀을 때만 수집합니다.")
 group_name=st.sidebar.text_input("관심그룹 이름", value="기본 관심그룹")
 new_ticker=st.sidebar.text_input("관심 종목 추가", value="")
 if st.sidebar.button("관심그룹에 추가") and new_ticker:
@@ -455,13 +550,70 @@ else:
     st.sidebar.info("관심종목이 없습니다.")
 
 # ----------------------------- Layout -----------------------------
-st.title("📈 Stock Agent Pro V13 — 매도 타이밍·포트폴리오 관리 OS")
-st.caption("자동 데이터 요청을 최소화했습니다. 후보 분석, 현 상황 분석, 백테스트는 버튼을 눌렀을 때만 실행됩니다.")
+st.title("📈 Kappy Investment OS V14 — 보유종목·매도 엔진")
+st.caption("앱을 켜면 보유 종목과 오늘 해야 할 일을 먼저 확인하고, 데이터는 버튼을 눌렀을 때만 수집합니다.")
 
-tabs = st.tabs(["종목 차트·에이전트", "후보 스캐너", "시장·섹터", "백테스트", "포트폴리오·매도관리", "매매일지", "성과학습"])
+tabs = st.tabs(["오늘 브리핑", "보유종목", "종목 차트·에이전트", "후보 스캐너", "시장·섹터", "백테스트", "포트폴리오", "매매일지", "성과학습"])
+
+# ----------------------------- Today briefing -----------------------------
+with tabs[0]:
+    st.subheader("오늘 해야 할 일")
+    mr = market_regime()
+    c1,c2,c3 = st.columns(3)
+    c1.metric("시장 체제", mr["시장체제"], f"점수 {mr['점수']}")
+    c2.metric("권장 현금비중", f"{mr['권장현금비중%']}%")
+    c3.caption(mr.get("근거", ""))
+    st.markdown("---")
+    h = holdings_df()
+    if h.empty or h[h["실제투자"]==True].empty:
+        st.info("실제 보유 종목이 없습니다. '보유종목' 탭에서 보유 종목을 추가하거나 포트폴리오에서 실제 투자 체크를 하세요.")
+    else:
+        if st.button("오늘 보유종목 AI 브리핑 생성", type="primary"):
+            st.session_state["v14_briefing"] = v14_briefing_rows()
+        bdf = st.session_state.get("v14_briefing")
+        if isinstance(bdf, pd.DataFrame) and not bdf.empty:
+            buy_more = bdf[bdf["AI의견"].eq("추가매수")]
+            keep = bdf[bdf["AI의견"].eq("유지")]
+            reduce = bdf[bdf["AI의견"].isin(["비중축소", "절반매도", "전량매도 검토"])]
+            a,b,c = st.columns(3)
+            a.metric("추가매수 후보", len(buy_more))
+            b.metric("유지", len(keep))
+            c.metric("매도/축소 검토", len(reduce))
+            st.dataframe(bdf.sort_values("점수", ascending=False), width="stretch", hide_index=True)
+            st.markdown("### AI 요약")
+            for _, r in bdf.sort_values("점수", ascending=False).iterrows():
+                st.write(f"**{r['티커']} · {r['종목명']}**: {r['AI의견']} ({r['점수']:.0f}점, {r['등급']}) — {r['핵심근거']}")
+        else:
+            st.info("'오늘 보유종목 AI 브리핑 생성' 버튼을 누르세요.")
+
+# ----------------------------- Holdings first -----------------------------
+with tabs[1]:
+    st.subheader("보유종목 관리")
+    st.caption("실제 보유 종목을 계좌 중심으로 관리합니다. 체크된 종목은 관심그룹 '매수 종목'에 자동 등록됩니다.")
+    hdf = holdings_df()
+    if hdf.empty:
+        hdf = pd.DataFrame(columns=["실제투자","티커","종목명","매수가","매수금액","수량","소스","메모"])
+    edited = st.data_editor(hdf[[c for c in ["실제투자","티커","종목명","매수가","매수금액","수량","소스","메모"] if c in hdf.columns]], width="stretch", hide_index=True, num_rows="dynamic", key="v14_holdings_editor")
+    c1,c2 = st.columns(2)
+    if c1.button("보유종목 저장", type="primary"):
+        save_holdings(edited)
+        st.success("저장했습니다. 실제투자 체크 종목은 관심종목 '매수 종목'에 등록됩니다.")
+        st.rerun()
+    if c2.button("보유종목 현 상황 분석"):
+        save_holdings(edited)
+        st.session_state["v14_holding_analysis"] = v14_briefing_rows()
+    adf = st.session_state.get("v14_holding_analysis")
+    if isinstance(adf, pd.DataFrame) and not adf.empty:
+        st.markdown("### 5단계 매도 엔진 결과")
+        st.dataframe(adf.sort_values("점수", ascending=False), width="stretch", hide_index=True)
+        sel = st.selectbox("차트로 확인할 보유 종목", adf["티커"].tolist())
+        d = fetch_price(sel, period="6mo", interval="1d", ttl_hours=6)
+        h = fetch_price(sel, period="1mo", interval="15m", ttl_hours=3)
+        st.plotly_chart(price_chart(d, sel, "V14 매도 판단 참고"), width="stretch")
+        st.plotly_chart(hhll_chart(h, sel), width="stretch")
 
 # ----------------------------- Chart tab -----------------------------
-with tabs[0]:
+with tabs[2]:
     c1,c2,c3=st.columns([1.4,1,1])
     default = selected_from_sidebar or st.session_state.get("selected_ticker", "TSLA")
     ticker = c1.text_input("티커 검색", value=default).upper().strip()
@@ -492,7 +644,7 @@ with tabs[0]:
         st.info("티커 입력 후 '현 종목 분석'을 누르세요. 앱 시작 시 자동 다운로드하지 않습니다.")
 
 # ----------------------------- Scanner -----------------------------
-with tabs[1]:
+with tabs[3]:
     st.subheader("후보 스캐너")
     st.caption("Rate limit 방지를 위해 버튼을 눌렀을 때만 순차 분석합니다. 처음에는 20개 이하를 권장합니다.")
     c1,c2=st.columns(2)
@@ -513,7 +665,7 @@ with tabs[1]:
         st.info("후보 분석 실행 버튼을 누르면 결과가 표시됩니다.")
 
 # ----------------------------- Market -----------------------------
-with tabs[2]:
+with tabs[4]:
     st.subheader("시장 체제·섹터 로테이션")
     if st.button("시장·섹터 분석 실행", type="primary"):
         st.session_state["market_regime"]=market_regime()
@@ -527,7 +679,7 @@ with tabs[2]:
         st.info("시장·섹터 분석 실행 버튼을 누르세요.")
 
 # ----------------------------- Backtest -----------------------------
-with tabs[3]:
+with tabs[5]:
     st.subheader("백테스트")
     c1,c2=st.columns(2)
     count=c1.selectbox("검증 종목 수", [20,50,100], index=0)
@@ -549,7 +701,7 @@ with tabs[3]:
         st.info("백테스트 실행 버튼을 누르세요.")
 
 # ----------------------------- Portfolio sell management -----------------------------
-with tabs[4]:
+with tabs[6]:
     st.subheader("포트폴리오·매도 타이밍 관리")
     st.caption("백테스트 상위 5개로 포트폴리오를 만들고, 실제 투자한 종목을 체크하면 관심종목(매수 종목)에 자동 등록됩니다.")
     c1,c2,c3=st.columns(3)
@@ -604,7 +756,7 @@ with tabs[4]:
                 st.rerun()
 
 # ----------------------------- Journal -----------------------------
-with tabs[5]:
+with tabs[7]:
     st.subheader("매매일지")
     with st.form("journal"):
         c1,c2,c3,c4,c5,c6=st.columns(6)
@@ -627,7 +779,7 @@ with tabs[5]:
         st.info("아직 기록된 매매가 없습니다.")
 
 # ----------------------------- Learning -----------------------------
-with tabs[6]:
+with tabs[8]:
     st.subheader("성과학습")
     st.caption("추천과 실제 매매 기록이 쌓이면 어떤 조건이 잘 맞았는지 확인합니다.")
     jrows=q("SELECT ticker,name,side,entry,quantity,exit_price,status,opened_at,closed_at FROM trade_journal", fetch=True) or []
