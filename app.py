@@ -37,6 +37,16 @@ SECTOR_ETFS = {
     "산업재":"XLI", "소비재":"XLY", "필수소비":"XLP"
 }
 
+DEFAULT_REAL_PORTFOLIO = [
+    ("MU", "Micron Technology"),
+    ("NVDA", "NVIDIA"),
+    ("AMD", "Advanced Micro Devices"),
+    ("TSLA", "Tesla"),
+    ("ORCL", "Oracle"),
+    ("SPACEX", "SpaceX · 비상장 참고")
+]
+
+
 def rsi(series: pd.Series, period: int = 14) -> pd.Series:
     delta = series.diff()
     gain = delta.clip(lower=0).rolling(period).mean()
@@ -217,7 +227,8 @@ def v14_briefing_rows() -> pd.DataFrame:
         intraday=fetch_price(t, period="1mo", interval="15m", ttl_hours=3)
         dec=v14_position_decision(daily, intraday, float(r.get("매수가") or 0), None)
         bp=float(r.get("매수가") or 0)
-        current=dec.get("현재가",0)
+        current=latest_current_price(t, daily) or dec.get("현재가",0)
+        dec["현재가"] = current
         pnl=(current/bp-1)*100 if current and bp else 0
         rows.append({"티커":t,"종목명":r.get("종목명") or get_us_name(t),"수익률%":round(pnl,2),"AI의견":dec["AI의견"],"등급":dec["등급"],"점수":dec["종합점수"],"현재가":dec["현재가"],"ATR손절":dec["ATR손절"],"추적손절":dec["추적손절"],"터틀손절":dec["터틀손절"],"핵심근거":dec["핵심근거"]})
     return pd.DataFrame(rows)
@@ -258,9 +269,31 @@ def fetch_price(ticker: str, period: str="6mo", interval: str="1d", ttl_hours: i
             st.warning(f"{ticker} 데이터 요청 실패: {e}")
         return _read_cache(path, ttl_hours=24*30)
 
+
+def latest_current_price(ticker: str, fallback_df: pd.DataFrame | None = None) -> float:
+    """검색/분석 시점에 최대한 가까운 현재가를 가져온다.
+    우선 30분봉 최근값을 사용하고, 실패하면 전달된 일봉/캐시 데이터의 종가를 사용한다.
+    """
+    t = normalize_ticker(ticker) if 'normalize_ticker' in globals() else str(ticker).upper().strip()
+    if t == "SPACEX":
+        return 0.0
+    intraday = fetch_price(t, period="5d", interval="30m", ttl_hours=1)
+    if intraday is not None and not intraday.empty:
+        try:
+            return round(float(intraday.dropna()["Close"].iloc[-1]), 4)
+        except Exception:
+            pass
+    if fallback_df is not None and not fallback_df.empty:
+        try:
+            return round(float(fallback_df.dropna()["Close"].iloc[-1]), 4)
+        except Exception:
+            pass
+    return 0.0
+
 @st.cache_data(ttl=86400, show_spinner=False)
 def get_us_name(ticker: str) -> str:
     t = str(ticker).upper().strip()
+    if t == "SPACEX": return "SpaceX · 비상장 참고"
     if t in NAME_FALLBACK: return NAME_FALLBACK[t]
     try:
         info2 = yf.Ticker(t).info
@@ -324,7 +357,7 @@ def hhll_chart(df: pd.DataFrame, ticker: str):
 
 DB_PATH = "stock_agent_v14.db"
 
-st.set_page_config(page_title="Kappy Investment OS V14", page_icon="📈", layout="wide")
+st.set_page_config(page_title="Kappy Investment OS V14.1", page_icon="📈", layout="wide")
 
 CSS = """
 <style>
@@ -407,8 +440,13 @@ def save_holdings(df: pd.DataFrame):
         buy_price = float(r.get("매수가") or 0)
         buy_amount = float(r.get("매수금액") or 0)
         qty = float(r.get("수량") or 0)
-        if qty <= 0 and buy_price > 0 and buy_amount > 0:
+        # V14.1: 사용자는 매수금액과 수량만 입력하면 됨. 매수가는 자동 계산.
+        if buy_amount > 0 and qty > 0:
+            buy_price = buy_amount / qty
+        elif buy_price > 0 and buy_amount > 0 and qty <= 0:
             qty = buy_amount / buy_price
+        elif buy_price > 0 and qty > 0 and buy_amount <= 0:
+            buy_amount = buy_price * qty
         q("""INSERT OR REPLACE INTO portfolio_holdings
              (ticker,name,invested,buy_price,buy_amount,quantity,source,memo,updated_at)
              VALUES(?,?,?,?,?,?,?,?,?)""", (t, name, invested, buy_price, buy_amount, qty, r.get("소스", ""), r.get("메모", ""), now()))
@@ -518,7 +556,8 @@ def analyze_holdings_current(df_holdings: pd.DataFrame) -> pd.DataFrame:
         daily=fetch_price(t, period="6mo", interval="1d", ttl_hours=6)
         intraday=fetch_price(t, period="1mo", interval="15m", ttl_hours=3)
         dec=v14_position_decision(daily, intraday, float(r.get("매수가") or 0), None)
-        current=dec.get("현재가") or 0
+        current=latest_current_price(t, daily) or dec.get("현재가") or 0
+        dec["현재가"] = current
         buy_price=float(r.get("매수가") or 0)
         amount=float(r.get("매수금액") or 0)
         pnl=(current/buy_price-1)*100 if current and buy_price else 0
@@ -527,7 +566,7 @@ def analyze_holdings_current(df_holdings: pd.DataFrame) -> pd.DataFrame:
 
 # ----------------------------- Sidebar -----------------------------
 st.sidebar.header("설정")
-st.sidebar.caption("V14는 보유 종목 중심 UI와 5단계 매도 엔진을 추가했습니다. 데이터는 버튼을 눌렀을 때만 수집합니다.")
+st.sidebar.caption("V14.1은 실제 투자 포트폴리오 모드와 자동 매수가 계산을 추가했습니다. 데이터는 버튼을 눌렀을 때만 수집합니다.")
 group_name=st.sidebar.text_input("관심그룹 이름", value="기본 관심그룹")
 new_ticker=st.sidebar.text_input("관심 종목 추가", value="")
 if st.sidebar.button("관심그룹에 추가") and new_ticker:
@@ -550,7 +589,7 @@ else:
     st.sidebar.info("관심종목이 없습니다.")
 
 # ----------------------------- Layout -----------------------------
-st.title("📈 Kappy Investment OS V14 — 보유종목·매도 엔진")
+st.title("📈 Kappy Investment OS V14.1 — 보유종목·매도 엔진")
 st.caption("앱을 켜면 보유 종목과 오늘 해야 할 일을 먼저 확인하고, 데이터는 버튼을 눌렀을 때만 수집합니다.")
 
 tabs = st.tabs(["오늘 브리핑", "보유종목", "종목 차트·에이전트", "후보 스캐너", "시장·섹터", "백테스트", "포트폴리오", "매매일지", "성과학습"])
@@ -566,7 +605,12 @@ with tabs[0]:
     st.markdown("---")
     h = holdings_df()
     if h.empty or h[h["실제투자"]==True].empty:
-        st.info("실제 보유 종목이 없습니다. '보유종목' 탭에서 보유 종목을 추가하거나 포트폴리오에서 실제 투자 체크를 하세요.")
+        st.info("실제 보유 종목이 없습니다. 아래 버튼으로 기본 실제 투자 포트폴리오 모드를 시작하거나, '보유종목' 탭에서 직접 추가하세요.")
+        if st.button("실제 투자 기본 포트폴리오 불러오기 · MU/NVDA/AMD/TSLA/ORCL/SpaceX", type="primary"):
+            rows=[{"실제투자": True, "티커": t, "종목명": n, "매수가": 0.0, "매수금액": 0.0, "수량": 0.0, "소스": "기본 실제 투자 포트폴리오", "메모": "매수금액과 수량을 입력하면 매수가는 자동 계산됩니다."} for t,n in DEFAULT_REAL_PORTFOLIO]
+            save_holdings(pd.DataFrame(rows))
+            st.success("기본 실제 투자 포트폴리오를 추가했습니다. 보유종목 탭에서 매수금액과 수량만 입력하세요.")
+            st.rerun()
     else:
         if st.button("오늘 보유종목 AI 브리핑 생성", type="primary"):
             st.session_state["v14_briefing"] = v14_briefing_rows()
@@ -593,7 +637,20 @@ with tabs[1]:
     hdf = holdings_df()
     if hdf.empty:
         hdf = pd.DataFrame(columns=["실제투자","티커","종목명","매수가","매수금액","수량","소스","메모"])
-    edited = st.data_editor(hdf[[c for c in ["실제투자","티커","종목명","매수가","매수금액","수량","소스","메모"] if c in hdf.columns]], width="stretch", hide_index=True, num_rows="dynamic", key="v14_holdings_editor")
+        if st.button("실제 투자 기본 포트폴리오 불러오기", type="primary", key="seed_holdings_tab"):
+            rows=[{"실제투자": True, "티커": t, "종목명": n, "매수가": 0.0, "매수금액": 0.0, "수량": 0.0, "소스": "기본 실제 투자 포트폴리오", "메모": "매수금액과 수량만 입력"} for t,n in DEFAULT_REAL_PORTFOLIO]
+            save_holdings(pd.DataFrame(rows)); st.rerun()
+    st.info("매수금액과 수량만 입력해도 매수가는 저장 시 자동 계산됩니다. 종목명도 티커 기준으로 자동 보정됩니다.")
+    edited = st.data_editor(
+        hdf[[c for c in ["실제투자","티커","종목명","매수가","매수금액","수량","소스","메모"] if c in hdf.columns]],
+        width="stretch", hide_index=True, num_rows="dynamic", key="v14_holdings_editor",
+        disabled=["종목명","매수가"],
+        column_config={
+            "매수가": st.column_config.NumberColumn("매수가 · 자동계산", help="매수금액 ÷ 수량으로 자동 계산됩니다."),
+            "매수금액": st.column_config.NumberColumn("매수금액", min_value=0.0, step=100.0),
+            "수량": st.column_config.NumberColumn("수량", min_value=0.0, step=1.0),
+        }
+    )
     c1,c2 = st.columns(2)
     if c1.button("보유종목 저장", type="primary"):
         save_holdings(edited)
@@ -635,8 +692,10 @@ with tabs[2]:
                 st.plotly_chart(hhll_chart(hdf,ticker), width="stretch")
             with right:
                 sc,reasons=latest_technical_score(df)
+                current=latest_current_price(ticker, df)
                 opinion="매수" if sc>=2.5 else "매도" if sc<=-1.5 else "관망"
                 st.subheader(opinion)
+                st.metric("현재가 · 검색시점 기준", current if current else "확인불가")
                 st.metric("기술점수", sc)
                 st.write(f"핵심 기술 근거는 {', '.join(reasons[:5])}입니다.")
                 st.caption("뉴스·옵션 데이터는 자동 요청하지 않습니다. 필요 시 후보 스캐너/시장 탭에서 별도 실행하세요.")
@@ -723,7 +782,16 @@ with tabs[6]:
         # merge optional stop/target from session plan if missing in DB display
         for col in ["손절참고","목표참고"]:
             if col not in hdf.columns: hdf[col]=0.0
-        edited=st.data_editor(hdf[[c for c in edit_cols if c in hdf.columns]], width="stretch", hide_index=True, num_rows="dynamic", key="holdings_editor")
+        st.info("매수금액과 수량만 수정하면 매수가는 자동으로 다시 계산됩니다.")
+        edited=st.data_editor(
+            hdf[[c for c in edit_cols if c in hdf.columns]], width="stretch", hide_index=True, num_rows="dynamic", key="holdings_editor",
+            disabled=["종목명","매수가","손절참고","목표참고"],
+            column_config={
+                "매수가": st.column_config.NumberColumn("매수가 · 자동계산", help="매수금액 ÷ 수량으로 자동 계산됩니다."),
+                "매수금액": st.column_config.NumberColumn("매수금액", min_value=0.0, step=100.0),
+                "수량": st.column_config.NumberColumn("수량", min_value=0.0, step=1.0),
+            }
+        )
         csave,canalyze=st.columns(2)
         if csave.button("포트폴리오 수정 저장"):
             save_holdings(edited)
@@ -747,11 +815,11 @@ with tabs[6]:
         with st.form("manual_hold"):
             c1,c2,c3,c4=st.columns(4)
             mt=c1.text_input("티커", value="TSLA").upper().strip()
-            bp=c2.number_input("매수가", min_value=0.0, value=0.0, step=0.01)
-            ba=c3.number_input("매수금액", min_value=0.0, value=0.0, step=100.0)
+            ba=c2.number_input("매수금액", min_value=0.0, value=0.0, step=100.0)
+            qty=c3.number_input("수량", min_value=0.0, value=0.0, step=1.0)
             inv=c4.checkbox("실제투자", value=True)
             if st.form_submit_button("보유 종목 추가") and mt:
-                qty=ba/bp if bp>0 and ba>0 else 0
+                bp=ba/qty if ba>0 and qty>0 else 0
                 save_holdings(pd.DataFrame([{"실제투자":inv,"티커":mt,"종목명":get_us_name(mt),"매수가":bp,"매수금액":ba,"수량":qty,"소스":"직접입력","메모":""}]))
                 st.rerun()
 
