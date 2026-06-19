@@ -11,8 +11,9 @@ def _rangebreaks():
 def price_chart(df: pd.DataFrame, title: str = "Price chart"):
     d = enrich(df)
     fig = go.Figure()
-    if d.empty:
-        fig.update_layout(title="데이터 없음")
+    if d.empty or len(d) < 2:
+        fig.update_layout(title="데이터 없음", height=360, xaxis=dict(visible=False), yaxis=dict(visible=False))
+        fig.add_annotation(text="가격 데이터를 가져오지 못했습니다.", x=0.5, y=0.5, xref="paper", yref="paper", showarrow=False)
         return fig
     fig.add_trace(go.Candlestick(x=d.index, open=d["Open"], high=d["High"], low=d["Low"], close=d["Close"], name="Price"))
     for col, name in [("EMA8","EMA8"),("EMA13","EMA13"),("MA21","MA21"),("MA55","MA55")]:
@@ -26,8 +27,9 @@ def price_chart(df: pd.DataFrame, title: str = "Price chart"):
 def hhll_chart(df: pd.DataFrame, title: str="HHLL"):
     d = add_hhll(df).dropna()
     fig = go.Figure()
-    if d.empty:
-        fig.update_layout(title="데이터 없음")
+    if d.empty or len(d) < 2:
+        fig.update_layout(title="데이터 없음", height=320, xaxis=dict(visible=False), yaxis=dict(visible=False))
+        fig.add_annotation(text="HHLL 데이터를 가져오지 못했습니다.", x=0.5, y=0.5, xref="paper", yref="paper", showarrow=False)
         return fig
     fig.add_trace(go.Candlestick(x=d.index, open=d["Open"], high=d["High"], low=d["Low"], close=d["Close"], name="15분봉"))
     fig.add_trace(go.Scatter(x=d.index, y=d["HH20"], name="Highest High 20", mode="lines"))
