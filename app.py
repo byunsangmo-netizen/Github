@@ -8,6 +8,7 @@ import streamlit as st
 import yfinance as yf
 import plotly.graph_objects as go
 import xml.etree.ElementTree as ET
+from bs4 import BeautifulSoup
 
 
 
@@ -542,24 +543,69 @@ def ticker_from_nh_row(name: str, code: str) -> str:
             return v
     return code
 
-def parse_nh_balance(uploaded_file) -> pd.DataFrame:
-    """NH 나무증권 종합잔고 HTML .xls 파일을 보유종목 형식으로 변환합니다."""
+def _decode_uploaded_html(uploaded_file) -> str:
+    """NH 나무증권이 .xls 확장자로 내려주는 HTML 파일을 안정적으로 문자열화합니다."""
     try:
-        tables = pd.read_html(uploaded_file, encoding="cp949")
+        uploaded_file.seek(0)
+        raw = uploaded_file.read()
     except Exception:
+        raw = uploaded_file
+    if isinstance(raw, str):
+        return raw
+    for enc in ["euc-kr", "cp949", "utf-8", "latin1"]:
         try:
-            uploaded_file.seek(0)
-            tables = pd.read_html(uploaded_file, encoding="euc-kr")
+            return raw.decode(enc)
         except Exception:
-            uploaded_file.seek(0)
-            tables = pd.read_html(uploaded_file)
-    if not tables or len(tables) < 2:
+            continue
+    return raw.decode("utf-8", errors="ignore")
+
+
+def _html_tables_bs4(html: str) -> List[pd.DataFrame]:
+    """pandas.read_html/lxml 없이 BeautifulSoup만으로 HTML table을 DataFrame으로 변환합니다."""
+    soup = BeautifulSoup(html, "html.parser")
+    tables: List[pd.DataFrame] = []
+    for table in soup.find_all("table"):
+        rows = []
+        for tr in table.find_all("tr"):
+            cells = [c.get_text(" ", strip=True) for c in tr.find_all(["th", "td"])]
+            if cells and any(str(x).strip() for x in cells):
+                rows.append(cells)
+        if not rows:
+            continue
+        max_len = max(len(r) for r in rows)
+        rows = [r + [""] * (max_len - len(r)) for r in rows]
+        # 첫 줄이 헤더일 가능성이 높으면 헤더로 사용합니다.
+        header = rows[0]
+        data = rows[1:] if len(rows) > 1 else []
+        if len(set(header)) == len(header) and any(h in header for h in ["잔고유형", "상품명", "상품코드", "수량", "매입금액"]):
+            tables.append(pd.DataFrame(data, columns=header))
+        else:
+            tables.append(pd.DataFrame(rows))
+    return tables
+
+
+def parse_nh_balance(uploaded_file) -> pd.DataFrame:
+    """NH 나무증권 종합잔고 HTML .xls 파일을 보유종목 형식으로 변환합니다.
+
+    V14.4 효율판: pandas.read_html(lxml 의존)을 쓰지 않고 BeautifulSoup로 직접 파싱합니다.
+    Streamlit Cloud에서 lxml 누락으로 생기는 ImportError를 방지합니다.
+    """
+    html = _decode_uploaded_html(uploaded_file)
+    tables = _html_tables_bs4(html)
+    if not tables:
         return pd.DataFrame()
-    df = tables[-1].copy()
-    needed = {"잔고유형","상품명","상품코드","수량","매입금액"}
-    if not needed.issubset(set(map(str, df.columns))):
+
+    df = None
+    needed = {"잔고유형", "상품명", "상품코드", "수량", "매입금액"}
+    for cand in tables:
+        cols = set(map(str, cand.columns))
+        if needed.issubset(cols):
+            df = cand.copy()
+            break
+    if df is None:
         return pd.DataFrame()
-    # 외화 환율 추정: 외화예수금 USD 행의 현재가가 환율로 들어오는 경우가 많습니다.
+
+    # 외화 환율 추정: 외화예수금 USD 행 또는 현재가가 환율로 들어오는 경우가 많습니다.
     fx = 1.0
     try:
         usd_rows = df[df["상품코드"].astype(str).str.upper().eq("USD")]
@@ -567,6 +613,7 @@ def parse_nh_balance(uploaded_file) -> pd.DataFrame:
             fx = _to_float(usd_rows.iloc[0].get("현재가"), 1.0) or 1.0
     except Exception:
         fx = 1.0
+
     rows=[]
     for _, r in df.iterrows():
         kind = str(r.get("잔고유형", ""))
@@ -583,10 +630,11 @@ def parse_nh_balance(uploaded_file) -> pd.DataFrame:
         ticker = ticker_from_nh_row(name, code)
         is_foreign = str(code).upper().startswith("US") or "외화" in kind
         buy_price = buy_amount_krw / qty / (fx if is_foreign and fx > 0 else 1.0)
+        # NH 파일의 현재가가 해외주식은 원화가 아니라 USD일 수 있으므로 매수가는 환율 추정 실패 시 보수적으로 원화로 남습니다.
         rows.append({
             "실제투자": True,
             "티커": ticker,
-            "종목명": get_us_name(ticker) if ticker.endswith(".KS") is False else name,
+            "종목명": get_us_name(ticker) if not str(ticker).endswith((".KS", ".KQ")) else name,
             "매수가": round(buy_price, 4),
             "매수금액": round(buy_price * qty, 2),
             "수량": qty,
@@ -638,6 +686,53 @@ def save_holdings(df: pd.DataFrame):
              VALUES(?,?,?,?,?,?,?,?,?)""", (t, name, invested, buy_price, buy_amount, qty, r.get("소스", ""), r.get("메모", ""), now()))
         if invested:
             add_watchlist(t, "매수 종목")
+
+
+def export_holdings_json() -> str:
+    """현재 보유종목을 JSON 문자열로 내보냅니다."""
+    df = holdings_df()
+    payload = {
+        "version": "V14.4",
+        "exported_at": now(),
+        "holdings": df.to_dict(orient="records") if df is not None and not df.empty else []
+    }
+    return json.dumps(payload, ensure_ascii=False, indent=2)
+
+
+def import_holdings_backup(uploaded_file, replace: bool = False) -> int:
+    """V14.4 JSON/CSV 백업 파일을 보유종목 DB에 반영합니다."""
+    if uploaded_file is None:
+        return 0
+    name = getattr(uploaded_file, "name", "").lower()
+    uploaded_file.seek(0)
+    if name.endswith(".json"):
+        raw = uploaded_file.read()
+        if isinstance(raw, bytes):
+            raw = raw.decode("utf-8-sig")
+        payload = json.loads(raw)
+        rows = payload.get("holdings", payload if isinstance(payload, list) else [])
+        df = pd.DataFrame(rows)
+    else:
+        df = pd.read_csv(uploaded_file)
+    if df.empty:
+        return 0
+    rename_map = {
+        "ticker": "티커", "name": "종목명", "invested": "실제투자",
+        "buy_price": "매수가", "buy_amount": "매수금액", "quantity": "수량",
+        "source": "소스", "memo": "메모"
+    }
+    df = df.rename(columns={k:v for k,v in rename_map.items() if k in df.columns})
+    for col in ["실제투자","티커","종목명","매수가","수량","소스","메모"]:
+        if col not in df.columns:
+            df[col] = False if col == "실제투자" else ""
+    df["실제투자"] = df["실제투자"].apply(lambda x: str(x).lower() in ["true","1","yes","y","예","네"] if not isinstance(x, bool) else x)
+    df["매수가"] = pd.to_numeric(df["매수가"], errors="coerce").fillna(0.0)
+    df["수량"] = pd.to_numeric(df["수량"], errors="coerce").fillna(0.0)
+    df["매수금액"] = (df["매수가"] * df["수량"]).round(2)
+    if replace:
+        q("DELETE FROM portfolio_holdings")
+    save_holdings(df[["실제투자","티커","종목명","매수가","매수금액","수량","소스","메모"]])
+    return len(df)
 
 def technical_row(ticker: str, period="6mo", interval="1d") -> Dict:
     df = fetch_price(ticker, period=period, interval=interval, ttl_hours=12)
@@ -752,7 +847,7 @@ def analyze_holdings_current(df_holdings: pd.DataFrame) -> pd.DataFrame:
 
 # ----------------------------- Sidebar -----------------------------
 st.sidebar.header("설정")
-st.sidebar.caption("V14.3은 NH 나무증권 잔고 가져오기와 AI Conviction Score를 추가했습니다. 데이터는 버튼을 눌렀을 때만 수집합니다.")
+st.sidebar.caption("V14.4는 보유종목 저장/복원 백업 기능을 추가했습니다. Streamlit Cloud 재시작에도 JSON 백업으로 빠르게 복원할 수 있습니다.")
 group_name=st.sidebar.text_input("관심그룹 이름", value="기본 관심그룹")
 new_ticker=st.sidebar.text_input("관심 종목 추가", value="")
 if st.sidebar.button("관심그룹에 추가") and new_ticker:
@@ -775,7 +870,7 @@ else:
     st.sidebar.info("관심종목이 없습니다.")
 
 # ----------------------------- Layout -----------------------------
-st.title("📈 Kappy Investment OS V14.2 — 보유종목·매도 엔진")
+st.title("📈 Kappy Investment OS V14.4 — 보유종목 저장·매도 엔진")
 st.caption("앱을 켜면 보유 종목과 오늘 해야 할 일을 먼저 확인합니다. NH 잔고 파일을 가져오고, 데이터는 버튼을 눌렀을 때만 수집합니다.")
 
 tabs = st.tabs(["오늘 브리핑", "보유종목", "종목 차트·에이전트", "후보 스캐너", "시장·섹터", "백테스트", "포트폴리오", "매매일지", "성과학습", "주식전망요약"])
@@ -820,6 +915,28 @@ with tabs[0]:
 with tabs[1]:
     st.subheader("보유종목 관리")
     st.caption("실제 보유 종목을 계좌 중심으로 관리합니다. 체크된 종목은 관심그룹 '매수 종목'에 자동 등록됩니다.")
+    with st.expander("💾 보유종목 저장/복원", expanded=True):
+        st.caption("Streamlit Cloud는 재부팅·재배포 때 내부 DB가 초기화될 수 있습니다. 아래 JSON 백업을 받아두면 다음 접속 때 바로 복원할 수 있습니다.")
+        backup_json = export_holdings_json()
+        st.download_button(
+            "보유종목 백업 다운로드(JSON)",
+            data=backup_json.encode("utf-8-sig"),
+            file_name=f"stock_agent_holdings_{dt.datetime.now().strftime('%Y%m%d_%H%M')}.json",
+            mime="application/json"
+        )
+        backup_file = st.file_uploader("보유종목 백업 복원(JSON/CSV)", type=["json", "csv"], key="holdings_backup_restore")
+        replace_backup = st.checkbox("복원 시 기존 보유종목 전체 교체", value=False)
+        if st.button("백업 파일 복원", type="secondary"):
+            if backup_file is None:
+                st.warning("복원할 JSON 또는 CSV 파일을 먼저 선택하세요.")
+            else:
+                try:
+                    cnt = import_holdings_backup(backup_file, replace=replace_backup)
+                    st.success(f"보유종목 {cnt}개를 복원했습니다.")
+                    st.rerun()
+                except Exception as e:
+                    st.error(f"복원 실패: {e}")
+
     nh_file = st.file_uploader("NH 나무증권 종합잔고(.xls HTML) 가져오기", type=["xls", "html", "htm"], key="nh_balance_uploader")
     if nh_file is not None:
         imported = parse_nh_balance(nh_file)
@@ -848,10 +965,11 @@ with tabs[1]:
             "수량": st.column_config.NumberColumn("수량", min_value=0.0, step=1.0),
         }
     )
-    if not hdf.empty:
-        preview = hdf[[c for c in ["티커","종목명","매수금액","수량","매수가"] if c in hdf.columns]].copy()
+    if edited is not None and not edited.empty:
+        preview = edited[[c for c in ["티커","종목명","매수가","수량"] if c in edited.columns]].copy()
+        preview["매수금액"] = (pd.to_numeric(preview["매수가"], errors="coerce").fillna(0) * pd.to_numeric(preview["수량"], errors="coerce").fillna(0)).round(2)
         st.caption("자동계산 매수금액 미리보기")
-        st.dataframe(preview, width="stretch", hide_index=True)
+        st.dataframe(preview[[c for c in ["티커","종목명","매수가","수량","매수금액"] if c in preview.columns]], width="stretch", hide_index=True)
     c1,c2 = st.columns(2)
     if c1.button("보유종목 저장", type="primary"):
         save_holdings(edited)
