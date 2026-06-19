@@ -66,11 +66,73 @@ def analyze_holdings(df: pd.DataFrame, progress=True) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
+
+def render_sidebar():
+    """V15.1 Dashboard Sidebar: 계좌 요약, 보유종목, 관심종목, 빠른 실행."""
+    with st.sidebar:
+        st.markdown("## 📈 Kappy OS")
+        st.caption("보유종목·관심종목·오늘 할 일을 왼쪽에서 바로 확인합니다.")
+
+        hdf = load_holdings()
+        if hdf is None or hdf.empty:
+            st.info("보유종목이 없습니다.")
+        else:
+            actual = hdf[hdf.get("actual", False) == True] if "actual" in hdf.columns else hdf
+            buy_amount = pd.to_numeric(hdf.get("buy_price", 0), errors="coerce").fillna(0) * pd.to_numeric(hdf.get("quantity", 0), errors="coerce").fillna(0)
+            st.metric("보유종목", len(actual))
+            st.metric("총 매수금액", f"${buy_amount.sum():,.0f}")
+
+            st.markdown("### ✅ 보유종목")
+            if actual.empty:
+                st.caption("실제투자 체크된 종목이 없습니다.")
+            else:
+                for _, r in actual.iterrows():
+                    t = norm_ticker(r.get("ticker"))
+                    name = r.get("name") or company_name(t)
+                    label = f"{t} · {name}"
+                    if st.button(label, key=f"side_hold_{t}", use_container_width=True):
+                        st.session_state["chart_ticker"] = t
+                        st.session_state["selected_ticker"] = t
+                        st.toast(f"{t} 선택")
+
+        st.divider()
+        st.markdown("### ⭐ 관심종목")
+        if "watchlist" not in st.session_state:
+            st.session_state["watchlist"] = ["ARM", "AVGO", "DELL"]
+        new_watch = st.text_input("관심종목 추가", key="side_new_watch", placeholder="예: PLTR")
+        if st.button("관심종목 추가", key="side_add_watch", use_container_width=True):
+            t = norm_ticker(new_watch)
+            if t and t not in st.session_state["watchlist"]:
+                st.session_state["watchlist"].append(t)
+                st.toast(f"{t} 추가")
+        for t in list(st.session_state["watchlist"]):
+            c1, c2 = st.columns([4,1])
+            if c1.button(f"{t} · {company_name(t)}", key=f"side_watch_{t}", use_container_width=True):
+                st.session_state["chart_ticker"] = t
+                st.session_state["selected_ticker"] = t
+                st.toast(f"{t} 선택")
+            if c2.button("×", key=f"side_del_{t}"):
+                st.session_state["watchlist"].remove(t)
+                st.rerun()
+
+        st.divider()
+        st.markdown("### 🤖 AI 빠른 실행")
+        if st.button("오늘 브리핑", key="side_today", use_container_width=True):
+            st.session_state["side_hint"] = "오늘 브리핑 탭에서 버튼을 눌러 보유종목을 분석하세요."
+        if st.button("후보분석", key="side_scanner", use_container_width=True):
+            st.session_state["side_hint"] = "후보 스캐너 탭에서 분석 종목 수를 선택하고 실행하세요."
+        if st.button("Conviction Score", key="side_conviction", use_container_width=True):
+            st.session_state["side_hint"] = "주식전망요약 탭에서 AI Conviction Score를 실행하세요."
+        if st.session_state.get("side_hint"):
+            st.info(st.session_state["side_hint"])
+
+
 def tabs_header():
     st.title("📈 Kappy Investment OS V15 — 정식 아키텍처")
     st.caption("보유종목 중심 · 버튼 실행형 데이터 수집 · AI Conviction Score · 매도 타이밍 엔진 · SQLite 저장")
 
 ensure_default_holdings()
+render_sidebar()
 
 tabs_header()
 tabs = st.tabs(["오늘 브리핑", "보유종목", "종목 차트·에이전트", "후보 스캐너", "시장·섹터", "백테스트", "포트폴리오", "매매일지", "성과학습", "주식전망요약"])
@@ -166,7 +228,7 @@ with tabs[1]:
 with tabs[2]:
     st.header("종목 차트·에이전트")
     col1, col2, col3 = st.columns([2,1,1])
-    ticker = col1.text_input("티커", value="MU", key="chart_ticker").upper()
+    ticker = col1.text_input("티커", value=st.session_state.get("chart_ticker", "MU"), key="chart_ticker").upper()
     period = col2.selectbox("기간", ["6mo","1mo","1wk","1d"], index=0, key="chart_period")
     interval = col3.selectbox("봉", ["1d","30m","15m"], index=0, key="chart_interval")
     if st.button("차트/분석 실행", key="chart_run"):
