@@ -1,109 +1,113 @@
 from __future__ import annotations
-import datetime as dt
+import sqlite3, json
+from pathlib import Path
 import pandas as pd
-import streamlit as st
 
-from market.symbols import UNIVERSE, SECTOR_ETFS, DEFAULT_HOLDINGS
-from market.data import get_price, latest_price, company_name, norm_ticker
-from core.indicators import technical_score_100, enrich
-from core.sell_engine import analyze_position
-from core.conviction import conviction_for
-from storage.db import init_db, load_holdings, save_holdings, to_json, from_json_bytes, append_recommendations, load_recommendations
-from broker.nh_import import parse_nh_balance
-from ui.charts import price_chart, hhll_chart
-
-st.set_page_config(page_title="Kappy Investment OS V15", layout="wide", page_icon="📈")
-
-st.markdown("""
-<style>
-html, body, [class*="css"] {font-size: 14px;}
-.block-container {padding-top: 2rem;}
-.small-note {color:#6b7280; font-size:0.9rem;}
-</style>
-""", unsafe_allow_html=True)
-
-init_db()
+DB_PATH = Path("kappy_investment_os.db")
 
 
-def ensure_default_holdings():
-    df = load_holdings()
+def connect():
+    return sqlite3.connect(DB_PATH, check_same_thread=False)
+
+
+def init_db():
+    con = connect(); cur = con.cursor()
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS holdings(
+        ticker TEXT PRIMARY KEY,
+        name TEXT,
+        actual INTEGER DEFAULT 1,
+        buy_price REAL DEFAULT 0,
+        quantity REAL DEFAULT 0,
+        buy_date TEXT DEFAULT '',
+        memo TEXT DEFAULT '',
+        currency TEXT DEFAULT 'USD'
+    )""")
+    try:
+        cur.execute("ALTER TABLE holdings ADD COLUMN currency TEXT DEFAULT 'USD'")
+    except Exception:
+        pass
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS trade_log(
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        ts TEXT,
+        ticker TEXT,
+        name TEXT,
+        side TEXT,
+        price REAL,
+        quantity REAL,
+        memo TEXT
+    )""")
+    cur.execute("""
+    CREATE TABLE IF NOT EXISTS recommendations(
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        ts TEXT,
+        ticker TEXT,
+        name TEXT,
+        score REAL,
+        opinion TEXT,
+        source TEXT
+    )""")
+    con.commit(); con.close()
+
+
+def load_holdings() -> pd.DataFrame:
+    init_db(); con = connect()
+    df = pd.read_sql_query("SELECT actual, ticker, name, COALESCE(currency, 'USD') AS currency, buy_price, quantity, buy_date, memo FROM holdings ORDER BY ticker", con)
+    con.close()
     if df.empty:
-        save_holdings(pd.DataFrame(DEFAULT_HOLDINGS))
+        return pd.DataFrame(columns=["actual","ticker","name","currency","buy_price","quantity","buy_date","memo"])
+    df["actual"] = df["actual"].astype(bool)
+    return df
 
 
-def holdings_with_values(df: pd.DataFrame, fetch: bool=False) -> pd.DataFrame:
-    out = df.copy()
-    vals=[]
-    for _, r in out.iterrows():
-        t = norm_ticker(r.get("ticker"))
-        p = latest_price(t) if fetch and t != "SPACEX" else None
-        vals.append(p)
-    if fetch:
-        out["current_price"] = vals
-    else:
-        out["current_price"] = None
-    out["buy_amount"] = pd.to_numeric(out.get("buy_price",0), errors="coerce").fillna(0) * pd.to_numeric(out.get("quantity",0), errors="coerce").fillna(0)
-    out["market_value"] = [((p or 0) * float(q or 0)) for p,q in zip(out["current_price"], out["quantity"])]
-    out["pnl%"] = [round(((p/b-1)*100),2) if p and b else 0.0 for p,b in zip(out["current_price"], out["buy_price"])]
-    return out
-
-
-def analyze_holdings(df: pd.DataFrame, progress=True) -> pd.DataFrame:
-    rows=[]
-    bar = st.progress(0) if progress else None
-    actual = df[df["actual"] == True] if "actual" in df else df
-    total = max(1, len(actual))
-    for i, (_, r) in enumerate(actual.iterrows()):
-        t = norm_ticker(r.get("ticker"))
-        if not t or t == "SPACEX":
-            rows.append({"티커":t,"종목명":r.get("name",t),"AI의견":"장기보유 참고","등급":"-","점수":50,"현재가":None,"수익률%":0,"ATR손절":None,"추적손절":None,"터틀손절":None,"핵심근거":"비상장/수동관리"})
+def save_holdings(df: pd.DataFrame):
+    init_db(); con = connect(); cur = con.cursor()
+    cur.execute("DELETE FROM holdings")
+    for _, r in df.iterrows():
+        ticker = str(r.get("ticker", "")).strip().upper()
+        if not ticker:
             continue
-        d = get_price(t, "6mo", "1d", ttl=1800)
-        h = get_price(t, "1mo", "15m", ttl=900)
-        res = analyze_position(d, h, float(r.get("buy_price",0) or 0), float(r.get("quantity",0) or 0))
-        rows.append({"티커":t,"종목명":r.get("name") or company_name(t), **res})
-        if bar: bar.progress((i+1)/total)
-    return pd.DataFrame(rows)
+        cur.execute("""INSERT OR REPLACE INTO holdings(ticker,name,actual,buy_price,quantity,buy_date,memo,currency)
+        VALUES(?,?,?,?,?,?,?,?)""", (
+            ticker, str(r.get("name", ticker)), int(bool(r.get("actual", True))),
+            float(r.get("buy_price", 0) or 0), float(r.get("quantity", 0) or 0),
+            str(r.get("buy_date", "") or ""), str(r.get("memo", "") or ""),
+            str(r.get("currency", "USD") or "USD")
+        ))
+    con.commit(); con.close()
 
 
+<<<<<<< HEAD
 def tabs_header():
     st.title("📈 Kappy Investment OS V15 — 정식 아키텍처")
     st.caption("보유종목 중심 · 버튼 실행형 데이터 수집 · AI Conviction Score · 매도 타이밍 엔진 · SQLite 저장")
 
 ensure_default_holdings()
+=======
+def append_recommendations(rows: list[dict], source: str):
+    import datetime as dt
+    init_db(); con = connect(); cur = con.cursor(); ts = dt.datetime.now().isoformat(timespec="seconds")
+    for r in rows:
+        cur.execute("INSERT INTO recommendations(ts,ticker,name,score,opinion,source) VALUES(?,?,?,?,?,?)", (
+            ts, r.get("티커") or r.get("ticker"), r.get("종목명") or r.get("name"),
+            float(r.get("점수", r.get("AI Conviction Score", 0)) or 0), r.get("의견", ""), source
+        ))
+    con.commit(); con.close()
 
-tabs_header()
-tabs = st.tabs(["오늘 브리핑", "보유종목", "종목 차트·에이전트", "후보 스캐너", "시장·섹터", "백테스트", "포트폴리오", "매매일지", "성과학습", "주식전망요약"])
 
-# 01 Today
-with tabs[0]:
-    st.header("오늘 해야 할 일")
-    st.caption("데이터 요청 과다를 막기 위해 버튼을 눌렀을 때만 보유종목을 분석합니다.")
-    hdf = load_holdings()
-    actual_count = int(hdf["actual"].sum()) if not hdf.empty else 0
-    c1,c2,c3 = st.columns(3)
-    c1.metric("실제 보유 종목", actual_count)
-    c2.metric("시장 체제", "Risk On")
-    c3.metric("권장 현금비중", "10%")
-    if st.button("오늘 보유종목 AI 브리핑 생성", key="today_analyze"):
-        result = analyze_holdings(hdf)
-        st.session_state["today_result"] = result
-    result = st.session_state.get("today_result")
-    if isinstance(result, pd.DataFrame) and not result.empty:
-        add = int((result["AI의견"] == "추가매수").sum())
-        hold = int((result["AI의견"] == "유지").sum())
-        reduce = int(result["AI의견"].isin(["비중축소","절반매도","전량매도 검토"]).sum())
-        c1,c2,c3 = st.columns(3)
-        c1.metric("추가매수 후보", add)
-        c2.metric("유지", hold)
-        c3.metric("매도/축소 검토", reduce)
-        st.dataframe(result, use_container_width=True, hide_index=True)
-        st.subheader("AI 요약")
-        for _, r in result.iterrows():
-            st.write(f"**{r['티커']} · {r['종목명']}**: {r['AI의견']} ({r['점수']}점, {r['등급']}) — {r['핵심근거']}")
-    else:
-        st.info("아직 오늘 브리핑을 생성하지 않았습니다.")
+def load_recommendations(limit:int=200) -> pd.DataFrame:
+    init_db(); con=connect()
+    df = pd.read_sql_query(f"SELECT * FROM recommendations ORDER BY id DESC LIMIT {int(limit)}", con)
+    con.close(); return df
 
+>>>>>>> 4ce4681d25c00875230976a699b34fa86efc2a39
+
+def to_json(df: pd.DataFrame) -> str:
+    return df.to_json(orient="records", force_ascii=False, indent=2)
+
+
+<<<<<<< HEAD
 # 02 Holdings
 with tabs[1]:
     st.header("보유종목 관리")
@@ -283,3 +287,8 @@ with tabs[9]:
             if heads:
                 st.write(f"**{t}**")
                 for h in heads[:3]: st.write("- "+h)
+=======
+def from_json_bytes(data: bytes) -> pd.DataFrame:
+    obj = json.loads(data.decode("utf-8"))
+    return pd.DataFrame(obj)
+>>>>>>> 4ce4681d25c00875230976a699b34fa86efc2a39
