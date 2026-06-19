@@ -1,5 +1,5 @@
 from __future__ import annotations
-import os, json, sqlite3, datetime as dt, time, hashlib
+import os, json, sqlite3, datetime as dt, time, hashlib, re, urllib.parse
 from typing import List, Dict
 
 import numpy as np
@@ -7,6 +7,7 @@ import pandas as pd
 import streamlit as st
 import yfinance as yf
 import plotly.graph_objects as go
+import xml.etree.ElementTree as ET
 
 
 
@@ -277,7 +278,7 @@ def latest_current_price(ticker: str, fallback_df: pd.DataFrame | None = None) -
     t = normalize_ticker(ticker) if 'normalize_ticker' in globals() else str(ticker).upper().strip()
     if t == "SPACEX":
         return 0.0
-    intraday = fetch_price(t, period="5d", interval="30m", ttl_hours=1)
+    intraday = fetch_price(t, period="5d", interval="30m", ttl_hours=0.25)
     if intraday is not None and not intraday.empty:
         try:
             return round(float(intraday.dropna()["Close"].iloc[-1]), 4)
@@ -355,9 +356,9 @@ def hhll_chart(df: pd.DataFrame, ticker: str):
     fig.update_layout(title=f"{ticker} HHLL 터틀트레이딩 참고 차트", height=430, xaxis_rangeslider_visible=False, margin=dict(l=20,r=20,t=50,b=20))
     return fig
 
-DB_PATH = "stock_agent_v14.db"
+DB_PATH = "stock_agent_v143.db"
 
-st.set_page_config(page_title="Kappy Investment OS V14.1", page_icon="📈", layout="wide")
+st.set_page_config(page_title="Kappy Investment OS V14.2", page_icon="📈", layout="wide")
 
 CSS = """
 <style>
@@ -367,6 +368,108 @@ html, body, [class*="css"] { font-size: 0.88rem; }
 </style>
 """
 st.markdown(CSS, unsafe_allow_html=True)
+
+
+# ----------------------------- AI Conviction / Outlook Summary -----------------------------
+AI_VALUE_CHAIN = {
+    "NVDA": (95, "AI 가속기·CUDA 생태계 핵심"), "AVGO": (88, "AI 네트워킹·ASIC·인프라 핵심"),
+    "AMD": (82, "AI GPU 후발 추격 및 서버 CPU"), "ARM": (78, "AI 엣지·저전력 CPU IP"),
+    "TSM": (94, "AI 반도체 파운드리 핵심"), "ASML": (90, "첨단 반도체 장비 독점적 위치"),
+    "MU": (86, "HBM·AI 메모리 밸류체인"), "ORCL": (76, "AI 클라우드 인프라·데이터베이스"),
+    "MSFT": (92, "AI 소프트웨어·클라우드 플랫폼"), "GOOGL": (85, "AI 모델·광고·클라우드"),
+    "GOOG": (85, "AI 모델·광고·클라우드"), "META": (82, "AI 광고·오픈소스 모델"),
+    "AMZN": (84, "AWS AI 인프라"), "PLTR": (80, "기업 AI 운영 플랫폼"),
+    "AAPL": (65, "온디바이스 AI 생태계"), "TSLA": (78, "자율주행·로봇·AI 추론"),
+    "SOXL": (75, "반도체 레버리지 ETF"),
+}
+POSITIVE_NEWS_WORDS = ["upgrade","outperform","beat","raise","raised","surge","record","growth","strong","partnership","contract","ai","demand","guidance","target raised","bullish","accelerate"]
+NEGATIVE_NEWS_WORDS = ["downgrade","underperform","miss","cut","lowered","slump","weak","lawsuit","probe","tariff","delay","risk","bearish","concern","investigation","recall","guidance cut"]
+
+def fetch_google_news_headlines(ticker: str, name: str = "", hours: int = 6, limit: int = 8) -> list[str]:
+    query = f'{ticker} {name} stock when:{hours}h'.strip()
+    url = "https://news.google.com/rss/search?q=" + urllib.parse.quote(query) + "&hl=en-US&gl=US&ceid=US:en"
+    try:
+        import requests
+        r = requests.get(url, timeout=8, headers={"User-Agent":"Mozilla/5.0"})
+        r.raise_for_status()
+        root = ET.fromstring(r.content)
+        return [item.findtext("title") or "" for item in root.findall(".//item")[:limit] if item.findtext("title")]
+    except Exception:
+        return []
+
+def recent_news_score(headlines: list[str]) -> tuple[float, list[str]]:
+    if not headlines:
+        return 0.0, ["최근 6시간 뉴스 헤드라인 없음 또는 RSS 요청 실패"]
+    txt = " ".join(headlines).lower()
+    pos = sum(1 for w in POSITIVE_NEWS_WORDS if w in txt)
+    neg = sum(1 for w in NEGATIVE_NEWS_WORDS if w in txt)
+    score = max(min((pos - neg) * 10 + 50, 100), 0)
+    return round(score, 1), [f"긍정 키워드 {pos}개", f"부정 키워드 {neg}개"]
+
+def target_price_score(ticker: str, current: float | None = None) -> tuple[float, str]:
+    try:
+        info = yf.Ticker(ticker).info
+        target = info.get("targetMeanPrice") or info.get("targetMedianPrice")
+        if current is None:
+            current = info.get("currentPrice") or info.get("regularMarketPrice")
+        if target and current and current > 0:
+            upside = (float(target) / float(current) - 1) * 100
+            sc = max(min((upside + 20) / 60 * 100, 100), 0)
+            return round(sc, 1), f"목표가 여력 {upside:.1f}%"
+    except Exception:
+        pass
+    return 50.0, "목표주가 데이터 부족: 중립"
+
+def technical_trend_score_100(df: pd.DataFrame) -> tuple[float, str]:
+    if df is None or df.empty:
+        return 0.0, "기술 데이터 부족"
+    sc, reasons = latest_technical_score(df)
+    conv = max(min((sc + 3) / 8 * 100, 100), 0)
+    return round(conv, 1), ", ".join(reasons[:4])
+
+def ai_value_chain_score(ticker: str) -> tuple[float, str]:
+    t = normalize_ticker(ticker)
+    if t in AI_VALUE_CHAIN:
+        return float(AI_VALUE_CHAIN[t][0]), AI_VALUE_CHAIN[t][1]
+    return 45.0, "AI 밸류체인 직접 노출도 낮거나 미확인"
+
+def money_flow_score(df: pd.DataFrame) -> tuple[float, str]:
+    if df is None or df.empty:
+        return 0.0, "자금유입 데이터 부족"
+    d = enrich(df).dropna()
+    if d.empty:
+        return 0.0, "자금유입 지표 계산 부족"
+    last = d.iloc[-1]
+    score = 50.0; notes=[]
+    vr = last.get("VOL_RATIO", np.nan)
+    if pd.notna(vr):
+        if vr >= 2.0: score += 25; notes.append(f"거래량 {vr:.1f}배")
+        elif vr >= 1.2: score += 12; notes.append(f"거래량 {vr:.1f}배")
+        elif vr < 0.7: score -= 8; notes.append(f"거래량 {vr:.1f}배: 약함")
+    if "OBV" in d.columns and "OBV_MA10" in d.columns and pd.notna(last.get("OBV_MA10")):
+        if last["OBV"] > last["OBV_MA10"]:
+            score += 15; notes.append("OBV가 10일 평균 위")
+        else:
+            score -= 10; notes.append("OBV가 10일 평균 아래")
+    return round(max(min(score,100),0),1), ", ".join(notes) if notes else "중립"
+
+def ai_conviction_row(ticker: str) -> dict:
+    t = normalize_ticker(ticker)
+    name = get_us_name(t)
+    df = fetch_price(t, period="6mo", interval="1d", ttl_hours=6, force=False)
+    current = float(df.dropna().iloc[-1]["Close"]) if df is not None and not df.empty else None
+    headlines = fetch_google_news_headlines(t, name, hours=6, limit=8)
+    news_sc, news_note = recent_news_score(headlines)
+    target_sc, target_note = target_price_score(t, current)
+    tech_sc, tech_note = technical_trend_score_100(df)
+    chain_sc, chain_note = ai_value_chain_score(t)
+    flow_sc, flow_note = money_flow_score(df)
+    total = news_sc*0.22 + target_sc*0.18 + tech_sc*0.25 + chain_sc*0.20 + flow_sc*0.15
+    opinion = "강한 긍정" if total >= 80 else "긍정" if total >= 65 else "중립" if total >= 50 else "주의" if total >= 35 else "부정"
+    return {"티커": t, "종목명": name, "AI Conviction Score": round(total,1), "의견": opinion,
+            "최근6시간뉴스": news_sc, "목표주가": target_sc, "기술추세": tech_sc, "AI밸류체인": chain_sc, "자금유입": flow_sc,
+            "핵심요약": f"뉴스: {'; '.join(news_note[:2])} / 목표가: {target_note} / 기술: {tech_note} / AI: {chain_note} / 자금: {flow_note}",
+            "주요헤드라인": " | ".join(headlines[:5]) if headlines else "최근 6시간 헤드라인 없음"}
 
 # ----------------------------- DB -----------------------------
 def con():
@@ -414,6 +517,84 @@ init_db()
 def normalize_ticker(t: str) -> str:
     return str(t or "").strip().upper()
 
+
+ISIN_TO_TICKER = {
+    "US0079031078":"AMD", "US0420682058":"ARM", "US11135F1012":"AVGO", "US24703L2025":"DELL",
+    "US25459W4583":"SOXL", "US4581401001":"INTC", "US5951121038":"MU", "US88160R1014":"TSLA",
+    "US67066G1040":"NVDA", "US68389X1054":"ORCL", "US0378331005":"AAPL", "US5949181045":"MSFT",
+    "US30303M1027":"META", "US02079K3059":"GOOGL", "US02079K1079":"GOOG", "US0231351067":"AMZN",
+}
+NAME_TO_TICKER = {
+    "마이크론":"MU", "엔비디아":"NVDA", "테슬라":"TSLA", "브로드컴":"AVGO", "암 홀딩스":"ARM",
+    "어드밴스드":"AMD", "AMD":"AMD", "인텔":"INTC", "오라클":"ORCL", "델테크놀로지":"DELL",
+    "디렉시온 반도체":"SOXL", "삼성전자":"005930.KS",
+}
+
+def ticker_from_nh_row(name: str, code: str) -> str:
+    code = str(code or "").strip().upper()
+    name = str(name or "").strip()
+    if code in ISIN_TO_TICKER:
+        return ISIN_TO_TICKER[code]
+    if re.fullmatch(r"\d{6}", code):
+        return code + ".KS"
+    for k, v in NAME_TO_TICKER.items():
+        if k.lower() in name.lower():
+            return v
+    return code
+
+def parse_nh_balance(uploaded_file) -> pd.DataFrame:
+    """NH 나무증권 종합잔고 HTML .xls 파일을 보유종목 형식으로 변환합니다."""
+    try:
+        tables = pd.read_html(uploaded_file, encoding="cp949")
+    except Exception:
+        try:
+            uploaded_file.seek(0)
+            tables = pd.read_html(uploaded_file, encoding="euc-kr")
+        except Exception:
+            uploaded_file.seek(0)
+            tables = pd.read_html(uploaded_file)
+    if not tables or len(tables) < 2:
+        return pd.DataFrame()
+    df = tables[-1].copy()
+    needed = {"잔고유형","상품명","상품코드","수량","매입금액"}
+    if not needed.issubset(set(map(str, df.columns))):
+        return pd.DataFrame()
+    # 외화 환율 추정: 외화예수금 USD 행의 현재가가 환율로 들어오는 경우가 많습니다.
+    fx = 1.0
+    try:
+        usd_rows = df[df["상품코드"].astype(str).str.upper().eq("USD")]
+        if not usd_rows.empty:
+            fx = _to_float(usd_rows.iloc[0].get("현재가"), 1.0) or 1.0
+    except Exception:
+        fx = 1.0
+    rows=[]
+    for _, r in df.iterrows():
+        kind = str(r.get("잔고유형", ""))
+        if not any(x in kind for x in ["주식", "외화주식", "외화ETP", "ETP"]):
+            continue
+        name = str(r.get("상품명", "")).strip()
+        code = str(r.get("상품코드", "")).strip()
+        if code.upper() == "USD" or not name:
+            continue
+        qty = _to_float(r.get("수량"), 0.0)
+        buy_amount_krw = _to_float(r.get("매입금액"), 0.0)
+        if qty <= 0 or buy_amount_krw <= 0:
+            continue
+        ticker = ticker_from_nh_row(name, code)
+        is_foreign = str(code).upper().startswith("US") or "외화" in kind
+        buy_price = buy_amount_krw / qty / (fx if is_foreign and fx > 0 else 1.0)
+        rows.append({
+            "실제투자": True,
+            "티커": ticker,
+            "종목명": get_us_name(ticker) if ticker.endswith(".KS") is False else name,
+            "매수가": round(buy_price, 4),
+            "매수금액": round(buy_price * qty, 2),
+            "수량": qty,
+            "소스": "NH 나무증권 잔고",
+            "메모": f"NH 원화매입금액 {buy_amount_krw:,.0f}원 / 환율 {fx:,.2f}" if is_foreign else "NH 국내주식 잔고",
+        })
+    return pd.DataFrame(rows)
+
 def add_watchlist(ticker: str, group="기본 관심그룹"):
     t = normalize_ticker(ticker)
     if not t: return
@@ -423,11 +604,23 @@ def watchlist_df() -> pd.DataFrame:
     rows = q("SELECT ticker,name,group_name,updated_at FROM watchlist ORDER BY group_name,ticker", fetch=True) or []
     return pd.DataFrame(rows, columns=["티커","종목명","그룹","업데이트"])
 
+def _to_float(v, default=0.0):
+    try:
+        if pd.isna(v):
+            return default
+        return float(str(v).replace(",", "").replace("원", "").replace("%", "").strip())
+    except Exception:
+        return default
+
 def holdings_df() -> pd.DataFrame:
     rows = q("SELECT ticker,name,invested,buy_price,buy_amount,quantity,source,memo,updated_at FROM portfolio_holdings ORDER BY invested DESC,ticker", fetch=True) or []
     df = pd.DataFrame(rows, columns=["티커","종목명","실제투자","매수가","매수금액","수량","소스","메모","업데이트"])
     if not df.empty:
         df["실제투자"] = df["실제투자"].astype(bool)
+        df["매수가"] = pd.to_numeric(df["매수가"], errors="coerce").fillna(0.0)
+        df["수량"] = pd.to_numeric(df["수량"], errors="coerce").fillna(0.0)
+        # V14.3: 매수가는 사용자가 입력하고, 매수금액은 매수가 × 수량으로 항상 자동 계산합니다.
+        df["매수금액"] = (df["매수가"] * df["수량"]).round(2)
     return df
 
 def save_holdings(df: pd.DataFrame):
@@ -437,16 +630,9 @@ def save_holdings(df: pd.DataFrame):
         if not t: continue
         name = r.get("종목명") or get_us_name(t)
         invested = 1 if bool(r.get("실제투자")) else 0
-        buy_price = float(r.get("매수가") or 0)
-        buy_amount = float(r.get("매수금액") or 0)
-        qty = float(r.get("수량") or 0)
-        # V14.1: 사용자는 매수금액과 수량만 입력하면 됨. 매수가는 자동 계산.
-        if buy_amount > 0 and qty > 0:
-            buy_price = buy_amount / qty
-        elif buy_price > 0 and buy_amount > 0 and qty <= 0:
-            qty = buy_amount / buy_price
-        elif buy_price > 0 and qty > 0 and buy_amount <= 0:
-            buy_amount = buy_price * qty
+        buy_price = _to_float(r.get("매수가"), 0.0)
+        qty = _to_float(r.get("수량"), 0.0)
+        buy_amount = round(buy_price * qty, 2) if buy_price > 0 and qty > 0 else 0.0
         q("""INSERT OR REPLACE INTO portfolio_holdings
              (ticker,name,invested,buy_price,buy_amount,quantity,source,memo,updated_at)
              VALUES(?,?,?,?,?,?,?,?,?)""", (t, name, invested, buy_price, buy_amount, qty, r.get("소스", ""), r.get("메모", ""), now()))
@@ -566,7 +752,7 @@ def analyze_holdings_current(df_holdings: pd.DataFrame) -> pd.DataFrame:
 
 # ----------------------------- Sidebar -----------------------------
 st.sidebar.header("설정")
-st.sidebar.caption("V14.1은 실제 투자 포트폴리오 모드와 자동 매수가 계산을 추가했습니다. 데이터는 버튼을 눌렀을 때만 수집합니다.")
+st.sidebar.caption("V14.3은 NH 나무증권 잔고 가져오기와 AI Conviction Score를 추가했습니다. 데이터는 버튼을 눌렀을 때만 수집합니다.")
 group_name=st.sidebar.text_input("관심그룹 이름", value="기본 관심그룹")
 new_ticker=st.sidebar.text_input("관심 종목 추가", value="")
 if st.sidebar.button("관심그룹에 추가") and new_ticker:
@@ -589,10 +775,10 @@ else:
     st.sidebar.info("관심종목이 없습니다.")
 
 # ----------------------------- Layout -----------------------------
-st.title("📈 Kappy Investment OS V14.1 — 보유종목·매도 엔진")
-st.caption("앱을 켜면 보유 종목과 오늘 해야 할 일을 먼저 확인하고, 데이터는 버튼을 눌렀을 때만 수집합니다.")
+st.title("📈 Kappy Investment OS V14.2 — 보유종목·매도 엔진")
+st.caption("앱을 켜면 보유 종목과 오늘 해야 할 일을 먼저 확인합니다. NH 잔고 파일을 가져오고, 데이터는 버튼을 눌렀을 때만 수집합니다.")
 
-tabs = st.tabs(["오늘 브리핑", "보유종목", "종목 차트·에이전트", "후보 스캐너", "시장·섹터", "백테스트", "포트폴리오", "매매일지", "성과학습"])
+tabs = st.tabs(["오늘 브리핑", "보유종목", "종목 차트·에이전트", "후보 스캐너", "시장·섹터", "백테스트", "포트폴리오", "매매일지", "성과학습", "주식전망요약"])
 
 # ----------------------------- Today briefing -----------------------------
 with tabs[0]:
@@ -607,7 +793,7 @@ with tabs[0]:
     if h.empty or h[h["실제투자"]==True].empty:
         st.info("실제 보유 종목이 없습니다. 아래 버튼으로 기본 실제 투자 포트폴리오 모드를 시작하거나, '보유종목' 탭에서 직접 추가하세요.")
         if st.button("실제 투자 기본 포트폴리오 불러오기 · MU/NVDA/AMD/TSLA/ORCL/SpaceX", type="primary"):
-            rows=[{"실제투자": True, "티커": t, "종목명": n, "매수가": 0.0, "매수금액": 0.0, "수량": 0.0, "소스": "기본 실제 투자 포트폴리오", "메모": "매수금액과 수량을 입력하면 매수가는 자동 계산됩니다."} for t,n in DEFAULT_REAL_PORTFOLIO]
+            rows=[{"실제투자": True, "티커": t, "종목명": n, "매수가": 0.0, "매수금액": 0.0, "수량": 0.0, "소스": "기본 실제 투자 포트폴리오", "메모": "매수가와 수량을 입력하면 매수금액·손절·목표가 자동 계산됩니다."} for t,n in DEFAULT_REAL_PORTFOLIO]
             save_holdings(pd.DataFrame(rows))
             st.success("기본 실제 투자 포트폴리오를 추가했습니다. 보유종목 탭에서 매수금액과 수량만 입력하세요.")
             st.rerun()
@@ -634,23 +820,38 @@ with tabs[0]:
 with tabs[1]:
     st.subheader("보유종목 관리")
     st.caption("실제 보유 종목을 계좌 중심으로 관리합니다. 체크된 종목은 관심그룹 '매수 종목'에 자동 등록됩니다.")
+    nh_file = st.file_uploader("NH 나무증권 종합잔고(.xls HTML) 가져오기", type=["xls", "html", "htm"], key="nh_balance_uploader")
+    if nh_file is not None:
+        imported = parse_nh_balance(nh_file)
+        if imported.empty:
+            st.warning("NH 잔고 파일에서 보유 종목을 찾지 못했습니다. 파일 형식을 확인해 주세요.")
+        else:
+            st.success(f"NH 잔고에서 {len(imported)}개 보유 종목을 읽었습니다.")
+            st.dataframe(imported[[c for c in ["실제투자","티커","종목명","매수가","수량","매수금액","소스","메모"] if c in imported.columns]], width="stretch", hide_index=True)
+            if st.button("NH 잔고를 보유종목에 반영", type="primary"):
+                save_holdings(imported)
+                st.success("NH 잔고를 저장했습니다. 실제투자 종목은 관심그룹 '매수 종목'에 등록됩니다.")
+                st.rerun()
     hdf = holdings_df()
     if hdf.empty:
         hdf = pd.DataFrame(columns=["실제투자","티커","종목명","매수가","매수금액","수량","소스","메모"])
         if st.button("실제 투자 기본 포트폴리오 불러오기", type="primary", key="seed_holdings_tab"):
-            rows=[{"실제투자": True, "티커": t, "종목명": n, "매수가": 0.0, "매수금액": 0.0, "수량": 0.0, "소스": "기본 실제 투자 포트폴리오", "메모": "매수금액과 수량만 입력"} for t,n in DEFAULT_REAL_PORTFOLIO]
+            rows=[{"실제투자": True, "티커": t, "종목명": n, "매수가": 0.0, "매수금액": 0.0, "수량": 0.0, "소스": "기본 실제 투자 포트폴리오", "메모": "매수가와 수량만 입력"} for t,n in DEFAULT_REAL_PORTFOLIO]
             save_holdings(pd.DataFrame(rows)); st.rerun()
-    st.info("매수금액과 수량만 입력해도 매수가는 저장 시 자동 계산됩니다. 종목명도 티커 기준으로 자동 보정됩니다.")
+    st.info("매수가와 수량만 입력하세요. 매수금액·손절참고·목표참고는 자동 계산됩니다.")
     edited = st.data_editor(
-        hdf[[c for c in ["실제투자","티커","종목명","매수가","매수금액","수량","소스","메모"] if c in hdf.columns]],
+        hdf[[c for c in ["실제투자","티커","종목명","매수가","수량","소스","메모"] if c in hdf.columns]],
         width="stretch", hide_index=True, num_rows="dynamic", key="v14_holdings_editor",
-        disabled=["종목명","매수가"],
+        disabled=["종목명"],
         column_config={
-            "매수가": st.column_config.NumberColumn("매수가 · 자동계산", help="매수금액 ÷ 수량으로 자동 계산됩니다."),
-            "매수금액": st.column_config.NumberColumn("매수금액", min_value=0.0, step=100.0),
+            "매수가": st.column_config.NumberColumn("매수가", min_value=0.0, step=0.01),
             "수량": st.column_config.NumberColumn("수량", min_value=0.0, step=1.0),
         }
     )
+    if not hdf.empty:
+        preview = hdf[[c for c in ["티커","종목명","매수금액","수량","매수가"] if c in hdf.columns]].copy()
+        st.caption("자동계산 매수금액 미리보기")
+        st.dataframe(preview, width="stretch", hide_index=True)
     c1,c2 = st.columns(2)
     if c1.button("보유종목 저장", type="primary"):
         save_holdings(edited)
@@ -778,20 +979,22 @@ with tabs[6]:
             st.success("포트폴리오 초안을 만들었습니다. 실제 투자한 종목을 체크하고 매수금액을 수정하세요.")
     hdf=holdings_df()
     if not hdf.empty:
-        edit_cols=["실제투자","티커","종목명","매수가","매수금액","수량","손절참고","목표참고","소스","메모"]
+        edit_cols=["실제투자","티커","종목명","매수가","수량","매수금액","손절참고","목표참고","소스","메모"]
         # merge optional stop/target from session plan if missing in DB display
         for col in ["손절참고","목표참고"]:
             if col not in hdf.columns: hdf[col]=0.0
-        st.info("매수금액과 수량만 수정하면 매수가는 자동으로 다시 계산됩니다.")
+        st.info("매수가와 수량만 수정하세요. 매수금액·손절참고·목표참고는 자동 계산됩니다.")
         edited=st.data_editor(
             hdf[[c for c in edit_cols if c in hdf.columns]], width="stretch", hide_index=True, num_rows="dynamic", key="holdings_editor",
-            disabled=["종목명","매수가","손절참고","목표참고"],
+            disabled=["종목명","매수금액","손절참고","목표참고"],
             column_config={
-                "매수가": st.column_config.NumberColumn("매수가 · 자동계산", help="매수금액 ÷ 수량으로 자동 계산됩니다."),
                 "매수금액": st.column_config.NumberColumn("매수금액", min_value=0.0, step=100.0),
                 "수량": st.column_config.NumberColumn("수량", min_value=0.0, step=1.0),
             }
         )
+        if not hdf.empty:
+            st.caption("자동계산 매수금액 미리보기")
+            st.dataframe(hdf[[c for c in ["티커","종목명","매수금액","수량","매수가"] if c in hdf.columns]], width="stretch", hide_index=True)
         csave,canalyze=st.columns(2)
         if csave.button("포트폴리오 수정 저장"):
             save_holdings(edited)
@@ -815,11 +1018,11 @@ with tabs[6]:
         with st.form("manual_hold"):
             c1,c2,c3,c4=st.columns(4)
             mt=c1.text_input("티커", value="TSLA").upper().strip()
-            ba=c2.number_input("매수금액", min_value=0.0, value=0.0, step=100.0)
+            bp=c2.number_input("매수가", min_value=0.0, value=0.0, step=0.01)
             qty=c3.number_input("수량", min_value=0.0, value=0.0, step=1.0)
             inv=c4.checkbox("실제투자", value=True)
             if st.form_submit_button("보유 종목 추가") and mt:
-                bp=ba/qty if ba>0 and qty>0 else 0
+                ba=bp*qty if bp>0 and qty>0 else 0
                 save_holdings(pd.DataFrame([{"실제투자":inv,"티커":mt,"종목명":get_us_name(mt),"매수가":bp,"매수금액":ba,"수량":qty,"소스":"직접입력","메모":""}]))
                 st.rerun()
 
@@ -863,3 +1066,47 @@ with tabs[8]:
             st.info("청산 완료된 거래가 아직 없습니다.")
     else:
         st.info("매매일지를 쌓으면 성과학습이 가능해집니다.")
+
+# ----------------------------- Outlook Summary / AI Conviction -----------------------------
+with tabs[9]:
+    st.subheader("주식전망요약 · AI Conviction Score")
+    st.markdown("""
+이런 판단을 더 객관적으로 만들기 위해 **AI Conviction Score(확신도 점수)** 를 사용합니다.
+
+매일 각 종목을 아래 5가지 항목으로 평가합니다.
+- 📰 **최근 6시간 뉴스 점수**
+- 💰 **기관 목표주가 변화/여력**
+- 📈 **기술적 추세**
+- 🌍 **AI 밸류체인 내 위치**
+- 💵 **자금 유입 강도**
+
+종합 점수는 100점 기준으로 계산합니다. 데이터 요청 과다를 막기 위해 버튼을 눌렀을 때만 실행됩니다.
+""")
+    base_tickers = []
+    h = holdings_df()
+    if not h.empty:
+        base_tickers += h[h["실제투자"]==True]["티커"].dropna().astype(str).tolist()
+    w = watchlist_df()
+    if not w.empty:
+        base_tickers += w["티커"].dropna().astype(str).tolist()
+    base_tickers = list(dict.fromkeys([normalize_ticker(x) for x in base_tickers if x])) or ["MU","NVDA","AMD","TSLA","ORCL","AVGO","ARM"]
+    tickers_text = st.text_area("분석할 종목", value=", ".join(base_tickers), height=80)
+    if st.button("AI Conviction Score 분석 실행", type="primary"):
+        tickers = [normalize_ticker(x) for x in re.split(r"[,\n\s]+", tickers_text) if normalize_ticker(x)]
+        rows=[]
+        prog=st.progress(0)
+        for i,t in enumerate(tickers[:30]):
+            rows.append(ai_conviction_row(t))
+            prog.progress((i+1)/max(len(tickers[:30]),1))
+        st.session_state["conviction_df"] = pd.DataFrame(rows).sort_values("AI Conviction Score", ascending=False) if rows else pd.DataFrame()
+    cdf = st.session_state.get("conviction_df")
+    if isinstance(cdf, pd.DataFrame) and not cdf.empty:
+        st.dataframe(cdf[["티커","종목명","AI Conviction Score","의견","최근6시간뉴스","목표주가","기술추세","AI밸류체인","자금유입","핵심요약"]], width="stretch", hide_index=True)
+        sel = st.selectbox("헤드라인 확인 종목", cdf["티커"].tolist())
+        row = cdf[cdf["티커"]==sel].iloc[0]
+        st.markdown("### 최근 확인된 주요 헤드라인")
+        for hline in str(row.get("주요헤드라인", "")).split(" | "):
+            if hline.strip():
+                st.write("- " + hline.strip())
+    else:
+        st.info("분석 실행 버튼을 누르면 종목별 AI Conviction Score가 계산됩니다.")
