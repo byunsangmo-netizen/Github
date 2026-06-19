@@ -1,6 +1,6 @@
-# Kappy Investment OS V15
+# Kappy Investment OS V15.1
 
-첫 번째 정식 아키텍처 버전입니다.
+정식 모듈형 아키텍처 + Dashboard Sidebar 버전입니다.
 
 ## 실행
 ```bash
@@ -8,18 +8,23 @@ pip install -r requirements.txt
 streamlit run app.py
 ```
 
-## 구조
-- `core/`: 지표, 점수, 매도 엔진, Conviction Score
-- `market/`: 가격 데이터, 종목명, 섹터/유니버스
-- `broker/`: NH 나무증권 HTML `.xls` 잔고 Import
-- `storage/`: SQLite 저장/복원
-- `ui/`: 차트 렌더링
+## V15.1 변경사항
+- 왼쪽 Dashboard Sidebar 추가
+- 보유종목 요약, 총 매수금액 표시
+- 보유종목 클릭 시 차트 티커 자동 변경
+- 관심종목 추가/삭제 및 클릭 선택
+- AI 빠른 실행 안내 버튼 추가
+- `.gitignore` 추가로 캐시/DB/pycache 업로드 방지
 
-## 핵심 기능
-- 보유종목 SQLite 저장 및 자동 복원
-- NH 나무증권 종합잔고 HTML `.xls` Import
-- 버튼 클릭 시에만 yfinance 데이터 요청
-- 오늘 브리핑
-- 보유종목 AI 매도 타이밍 분석
-- AI Conviction Score
-- 후보 스캐너, 섹터 로테이션, 간단 백테스트
+## GitHub 업로드 필수 파일/폴더
+- app.py
+- requirements.txt
+- README.md
+- .gitignore
+- broker/
+- core/
+- market/
+- storage/
+- ui/
+
+`__pycache__`, `cache_prices`, `*.pkl`, `*.db`는 올리지 마세요.
