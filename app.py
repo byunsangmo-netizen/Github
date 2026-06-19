@@ -78,9 +78,16 @@ def render_sidebar():
             st.info("보유종목이 없습니다.")
         else:
             actual = hdf[hdf.get("actual", False) == True] if "actual" in hdf.columns else hdf
-            buy_amount = pd.to_numeric(hdf.get("buy_price", 0), errors="coerce").fillna(0) * pd.to_numeric(hdf.get("quantity", 0), errors="coerce").fillna(0)
+            htmp = hdf.copy()
+            htmp["currency"] = htmp.get("currency", "USD")
+            htmp["buy_amount"] = pd.to_numeric(htmp.get("buy_price", 0), errors="coerce").fillna(0) * pd.to_numeric(htmp.get("quantity", 0), errors="coerce").fillna(0)
+            usd_total = htmp.loc[htmp["currency"].astype(str).str.upper().eq("USD"), "buy_amount"].sum()
+            krw_total = htmp.loc[htmp["currency"].astype(str).str.upper().eq("KRW"), "buy_amount"].sum()
             st.metric("보유종목", len(actual))
-            st.metric("총 매수금액", f"${buy_amount.sum():,.0f}")
+            if usd_total:
+                st.metric("미국주식 매수금액", f"${usd_total:,.0f}")
+            if krw_total:
+                st.metric("한국주식 매수금액", f"₩{krw_total:,.0f}")
 
             st.markdown("### ✅ 보유종목")
             if actual.empty:
@@ -211,7 +218,7 @@ with tabs[1]:
         key="holdings_editor_v15",
         column_config={
             "actual": st.column_config.CheckboxColumn("실제투자"),
-            "ticker": "티커", "name":"종목명",
+            "ticker": "티커", "name":"종목명", "currency":"통화",
             "buy_price": st.column_config.NumberColumn("매수가", format="%.4f"),
             "quantity": st.column_config.NumberColumn("수량", format="%.4f"),
             "buy_date":"매수일", "memo":"메모"
@@ -220,7 +227,7 @@ with tabs[1]:
     preview = edited.copy()
     preview["매수금액"] = pd.to_numeric(preview["buy_price"], errors="coerce").fillna(0) * pd.to_numeric(preview["quantity"], errors="coerce").fillna(0)
     st.write("자동 계산 미리보기")
-    st.dataframe(preview[["actual","ticker","name","buy_price","quantity","매수금액","buy_date","memo"]], use_container_width=True, hide_index=True)
+    st.dataframe(preview[["actual","ticker","name","currency","buy_price","quantity","매수금액","buy_date","memo"]], use_container_width=True, hide_index=True)
     if st.button("보유종목 저장", key="save_holdings_main"):
         save_holdings(edited); st.success("저장되었습니다.")
 
