@@ -454,7 +454,25 @@ def money_flow_score(df: pd.DataFrame) -> tuple[float, str]:
             score -= 10; notes.append("OBV가 10일 평균 아래")
     return round(max(min(score,100),0),1), ", ".join(notes) if notes else "중립"
 
+def unified_opinion_from_score(score: float) -> tuple[str, str]:
+    """전망요약과 보유종목 브리핑이 같은 언어를 쓰도록 통합한 판단 기준."""
+    if score >= 85:
+        return "추가매수", "AAA"
+    if score >= 70:
+        return "유지", "AA"
+    if score >= 55:
+        return "관망", "A"
+    if score >= 40:
+        return "비중축소", "B"
+    return "매도검토", "C"
+
 def ai_conviction_row(ticker: str) -> dict:
+    """
+    V14.5 통합 전망 엔진.
+    이전 버전은 주식전망요약은 '긍정/중립', 오늘브리핑은 '유지/비중축소'처럼
+    서로 다른 언어를 써서 같은 종목이 다르게 보였다.
+    이제 전망요약도 보유종목 브리핑과 같은 100점·등급·의견 체계를 사용한다.
+    """
     t = normalize_ticker(ticker)
     name = get_us_name(t)
     df = fetch_price(t, period="6mo", interval="1d", ttl_hours=6, force=False)
@@ -465,11 +483,36 @@ def ai_conviction_row(ticker: str) -> dict:
     tech_sc, tech_note = technical_trend_score_100(df)
     chain_sc, chain_note = ai_value_chain_score(t)
     flow_sc, flow_note = money_flow_score(df)
-    total = news_sc*0.22 + target_sc*0.18 + tech_sc*0.25 + chain_sc*0.20 + flow_sc*0.15
-    opinion = "강한 긍정" if total >= 80 else "긍정" if total >= 65 else "중립" if total >= 50 else "주의" if total >= 35 else "부정"
-    return {"티커": t, "종목명": name, "AI Conviction Score": round(total,1), "의견": opinion,
+
+    # 1) 중장기 전망 점수: 뉴스·목표가·AI 밸류체인·자금흐름 포함
+    outlook_score = news_sc*0.22 + target_sc*0.18 + tech_sc*0.25 + chain_sc*0.20 + flow_sc*0.15
+
+    # 2) 보유/매도 엔진 점수: EMA·MA55·RSI·HHLL 중심. 전망요약에도 같은 엔진을 일부 반영한다.
+    hold_decision = v14_position_decision(df, df, None, None) if df is not None and not df.empty else {"종합점수":50,"AI의견":"관망","등급":"C","핵심근거":"가격 데이터 부족"}
+    hold_score = float(hold_decision.get("종합점수", 50))
+
+    # 3) 최종 통합점수: 종목 전망 60%, 실제 매매 타이밍 40%
+    #    덕분에 전망 탭과 오늘 브리핑의 방향성이 크게 충돌하지 않는다.
+    total = round(outlook_score*0.60 + hold_score*0.40, 1)
+    opinion, grade = unified_opinion_from_score(total)
+
+    # 기술 경고가 강하면 최종 의견을 한 단계 낮춘다.
+    hard_warning = False
+    if df is not None and not df.empty and len(df.dropna()) >= 60:
+        d = enrich(df).dropna()
+        if not d.empty:
+            last = d.iloc[-1]
+            price = float(last["Close"])
+            if price < float(last["MA55"]) or float(last["EMA8"]) < float(last["EMA13"]):
+                hard_warning = True
+    if hard_warning and opinion in ["추가매수", "유지"]:
+        opinion = "관망"
+        grade = "A"
+
+    return {"티커": t, "종목명": name, "AI Conviction Score": total, "의견": opinion, "등급": grade,
+            "전망점수": round(outlook_score,1), "매매타이밍점수": round(hold_score,1),
             "최근6시간뉴스": news_sc, "목표주가": target_sc, "기술추세": tech_sc, "AI밸류체인": chain_sc, "자금유입": flow_sc,
-            "핵심요약": f"뉴스: {'; '.join(news_note[:2])} / 목표가: {target_note} / 기술: {tech_note} / AI: {chain_note} / 자금: {flow_note}",
+            "핵심요약": f"통합판단: {opinion}({total}점, {grade}) / 전망 {outlook_score:.1f}점 / 매매타이밍 {hold_score:.1f}점 / 뉴스: {'; '.join(news_note[:2])} / 목표가: {target_note} / 기술: {tech_note} / AI: {chain_note} / 자금: {flow_note}",
             "주요헤드라인": " | ".join(headlines[:5]) if headlines else "최근 6시간 헤드라인 없음"}
 
 # ----------------------------- DB -----------------------------
@@ -587,7 +630,7 @@ def _html_tables_bs4(html: str) -> List[pd.DataFrame]:
 def parse_nh_balance(uploaded_file) -> pd.DataFrame:
     """NH 나무증권 종합잔고 HTML .xls 파일을 보유종목 형식으로 변환합니다.
 
-    V14.4 효율판: pandas.read_html(lxml 의존)을 쓰지 않고 BeautifulSoup로 직접 파싱합니다.
+    V14.5 효율판: pandas.read_html(lxml 의존)을 쓰지 않고 BeautifulSoup로 직접 파싱합니다.
     Streamlit Cloud에서 lxml 누락으로 생기는 ImportError를 방지합니다.
     """
     html = _decode_uploaded_html(uploaded_file)
@@ -692,7 +735,7 @@ def export_holdings_json() -> str:
     """현재 보유종목을 JSON 문자열로 내보냅니다."""
     df = holdings_df()
     payload = {
-        "version": "V14.4",
+        "version": "V14.5",
         "exported_at": now(),
         "holdings": df.to_dict(orient="records") if df is not None and not df.empty else []
     }
@@ -700,7 +743,7 @@ def export_holdings_json() -> str:
 
 
 def import_holdings_backup(uploaded_file, replace: bool = False) -> int:
-    """V14.4 JSON/CSV 백업 파일을 보유종목 DB에 반영합니다."""
+    """V14.5 JSON/CSV 백업 파일을 보유종목 DB에 반영합니다."""
     if uploaded_file is None:
         return 0
     name = getattr(uploaded_file, "name", "").lower()
@@ -847,7 +890,7 @@ def analyze_holdings_current(df_holdings: pd.DataFrame) -> pd.DataFrame:
 
 # ----------------------------- Sidebar -----------------------------
 st.sidebar.header("설정")
-st.sidebar.caption("V14.4는 보유종목 저장/복원 백업 기능을 추가했습니다. Streamlit Cloud 재시작에도 JSON 백업으로 빠르게 복원할 수 있습니다.")
+st.sidebar.caption("V14.5는 보유종목 저장/복원 백업 기능을 추가했습니다. Streamlit Cloud 재시작에도 JSON 백업으로 빠르게 복원할 수 있습니다.")
 group_name=st.sidebar.text_input("관심그룹 이름", value="기본 관심그룹")
 new_ticker=st.sidebar.text_input("관심 종목 추가", value="")
 if st.sidebar.button("관심그룹에 추가") and new_ticker:
@@ -870,7 +913,7 @@ else:
     st.sidebar.info("관심종목이 없습니다.")
 
 # ----------------------------- Layout -----------------------------
-st.title("📈 Kappy Investment OS V14.4 — 보유종목 저장·매도 엔진")
+st.title("📈 Kappy Investment OS V14.5 — 보유종목 저장·매도 엔진")
 st.caption("앱을 켜면 보유 종목과 오늘 해야 할 일을 먼저 확인합니다. NH 잔고 파일을 가져오고, 데이터는 버튼을 눌렀을 때만 수집합니다.")
 
 tabs = st.tabs(["오늘 브리핑", "보유종목", "종목 차트·에이전트", "후보 스캐너", "시장·섹터", "백테스트", "포트폴리오", "매매일지", "성과학습", "주식전망요약"])
@@ -1219,7 +1262,7 @@ with tabs[9]:
         st.session_state["conviction_df"] = pd.DataFrame(rows).sort_values("AI Conviction Score", ascending=False) if rows else pd.DataFrame()
     cdf = st.session_state.get("conviction_df")
     if isinstance(cdf, pd.DataFrame) and not cdf.empty:
-        st.dataframe(cdf[["티커","종목명","AI Conviction Score","의견","최근6시간뉴스","목표주가","기술추세","AI밸류체인","자금유입","핵심요약"]], width="stretch", hide_index=True)
+        st.dataframe(cdf[["티커","종목명","AI Conviction Score","의견","등급","전망점수","매매타이밍점수","최근6시간뉴스","목표주가","기술추세","AI밸류체인","자금유입","핵심요약"]], width="stretch", hide_index=True)
         sel = st.selectbox("헤드라인 확인 종목", cdf["티커"].tolist())
         row = cdf[cdf["티커"]==sel].iloc[0]
         st.markdown("### 최근 확인된 주요 헤드라인")
