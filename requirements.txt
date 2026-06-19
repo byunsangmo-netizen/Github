@@ -5,3 +5,5 @@ plotly>=5.20.0
 yfinance>=0.2.50
 requests>=2.31.0
 python-dotenv>=1.0.1
+
+beautifulsoup4>=4.12.0
